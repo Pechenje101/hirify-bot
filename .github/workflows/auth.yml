@@ -1,0 +1,23 @@
+name: auth
+
+# Регистрация аккаунта hirify.me (email-OTP) и запись session-cookie в секреты
+# репозитория. Запускается вручную (workflow_dispatch). Значения (cookie/пароль)
+# в логи не попадают — из скрипта они уходят напрямую в секреты через API.
+on:
+  workflow_dispatch:
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt pynacl
+      - name: Регистрация аккаунта hirify.me + cookie в секреты
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python tools/register_hirify.py

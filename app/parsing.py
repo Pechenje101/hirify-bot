@@ -116,8 +116,12 @@ MENTION_BLOCKLIST = {
     "inject", "autowired", "component_scan", "configuration", "controller",
     "everyone", "here", "channel", "admin", "support", "moderator",
 }
-# сервисные ссылки самого hirify (их промо-каналы) — не рекрутеры
-HIRIFY_USERNAMES = {"hirify", "hirify_jobs", "hirifybot"}
+# сервисные ссылки самого hirify (промо-каналы и саппорт-бот) — не рекрутеры;
+# @hirify_support_bot встречается на каждой странице вакансии (подвал «Help»)
+HIRIFY_USERNAMES = {
+    "hirify", "hirify_jobs", "hirifybot", "hirify_support_bot",
+    "hirify_support", "hirify_global",
+}
 
 # Крипто-индустрия: заголовок/навыки/описание/компания.
 # Латиница — слова с жёсткой границей, кириллица — стемы с продолжением
