@@ -33,7 +33,7 @@ async def main() -> int:
             print(f"    {it.get('id')}  {it.get('slug')}  [source={it.get('source')}]")
 
         ok = bad = 0
-        for it in items[:4]:
+        for it in items[:2]:  # щадяще: анти-бот сайта реагирует на серии запросов
             full = str(it.get("slug"))
             try:
                 data = await client.fetch_vacancy(full)

@@ -426,3 +426,34 @@ def test_no_subscribers_no_job_fetching():
     stats2 = asyncio.run(mon.poll_once(source="test"))
     assert stats2["sent"] == 2
     db.close()
+
+
+def test_automation_flag_stops_poll_and_retries_later():
+    """403 automation_detected — временный: проход останавливается, вакансии
+    остаются на ретрай (не сгорают в skipped_restricted)."""
+    from app.hirify import HirifyAutomationError
+
+    class FlaggedClient(FakeClient):
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.flagged = True
+
+        async def fetch_contacts(self, slug):
+            if self.flagged:
+                raise HirifyAutomationError("сайт заподозрил автоматизацию (HTTP 403)")
+            return await super().fetch_contacts(slug)
+
+    mon, _, sender, db = make_monitor()
+    flagged = FlaggedClient(FEED_ITEMS, VACANCIES)
+    mon.client = flagged
+    stats = asyncio.run(mon.poll_once(source="test"))
+    # первая же вакансия словила флаг — обработка остановлена, ничего не отправлено
+    assert stats["fetch_failed"] == 1 and stats["sent"] == 0
+    assert db.job_status(101) == "fetch_failed"   # ретрай позже
+    assert sender.sent == []
+    # флаг спал — следующий проход доставляет всё
+    flagged.flagged = False
+    stats2 = asyncio.run(mon.poll_once(source="test"))
+    assert stats2["sent"] == 2
+    assert db.job_status(101) == "sent"
+    db.close()

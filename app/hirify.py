@@ -45,8 +45,13 @@ class HirifyAuthError(HirifyError):
 
 
 class HirifyRestrictedError(HirifyError):
-    """Доступ к контактам ограничен (403: премиум/лимит попыток) — финально,
+    """Доступ к контактам ограничен финально (403: премиум/нет попыток) —
     ретраить бессмысленно."""
+
+
+class HirifyAutomationError(HirifyError):
+    """Сайт заподозрил автоматизацию (403 automation_detected) — временно:
+    лучше притормозить и повторить позже."""
 
 
 class HirifyNotFound(HirifyError):
@@ -147,10 +152,16 @@ class HirifyClient:
                     # сессия не работает: cookie истёк/отозван
                     raise HirifyAuthError(f"сессия не принята (HTTP {resp.status_code})")
                 if resp.status_code == 403:
-                    # «No free attempts remaining. Premium subscription required»
-                    # или «access is restricted»: финальная ситуация для вакансии
+                    # различаем финальные и временные причины отказа:
+                    #  · премиум/лимит попыток («No free attempts remaining») —
+                    #    финально для этой вакансии;
+                    #  · «automation_detected» — временный флаг аккаунта.
+                    body = (resp.text or "")[:200]
+                    if "automation_detected" in body or "automated" in body:
+                        raise HirifyAutomationError(
+                            f"сайт заподозрил автоматизацию (HTTP 403): {body}")
                     raise HirifyRestrictedError(
-                        f"доступ к контактам ограничен (HTTP 403): {resp.text[:120]}")
+                        f"доступ к контактам ограничен (HTTP 403): {body}")
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", "5"))
                     log.warning("hirify api: 429, жду %.1fs", retry_after)

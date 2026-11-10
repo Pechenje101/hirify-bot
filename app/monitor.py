@@ -7,7 +7,8 @@ import time
 
 from .db import Database
 from .hirify import (
-    HirifyAuthError, HirifyClient, HirifyError, HirifyNotFound, HirifyRestrictedError,
+    HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
+    HirifyNotFound, HirifyRestrictedError,
 )
 from .parsing import vacancy_from_api
 from .sender import VacancySender
@@ -213,6 +214,14 @@ class Monitor:
                 full_slug = f"{job_id}-{slug}"
                 data = await self.client.fetch_vacancy(full_slug)
                 contacts_data = await self.client.fetch_contacts(full_slug)
+            except HirifyAutomationError as e:
+                # временный флаг «автоматизация»: дальше не долбаем — вакансии
+                # остаются необработанными и вернутся в следующем проходе,
+                # когда флаг спадёт (иначе можно усугубить)
+                log.warning("Сайт заподозрил автоматизацию — приостанавливаю проход: %s", e)
+                self.db.mark_job(job_id, "fetch_failed")
+                stats["fetch_failed"] += 1
+                break
             except HirifyRestrictedError as e:
                 # премиум-вакансия или лимит бесплатных просмотров контактов —
                 # ретраить бессмысленно, финализируем без рассылки
