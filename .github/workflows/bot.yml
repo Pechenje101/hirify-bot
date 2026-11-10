@@ -15,6 +15,13 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:   # перезапускать бота только при изменениях кода (не README/tools)
+      - 'app/**'
+      - 'main.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/bot.yml'
   schedule:
     - cron: '23 */6 * * *'
 

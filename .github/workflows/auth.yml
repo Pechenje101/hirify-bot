@@ -20,4 +20,6 @@ jobs:
       - name: Регистрация аккаунта hirify.me + cookie в секреты
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REG_EMAIL: ${{ secrets.REG_EMAIL }}
+          REG_MAILTOKEN: ${{ secrets.REG_MAILTOKEN }}
         run: python tools/register_hirify.py

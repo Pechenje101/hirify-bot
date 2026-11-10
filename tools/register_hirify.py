@@ -5,18 +5,21 @@
 в логи/артефакты: из скрипта они уходят напрямую в секреты репозитория
 (HIRIFY_COOKIE / HIRIFY_EMAIL / HIRIFY_PASSWORD) через GitHub API (sealed box).
 
-Схема (из JS-бандла сайта):
-  1) временный ящик на mail.tm (публичный API, без регистрации);
-  2) POST /auth/register/start {name, email, password, password_confirmation,
-     locale, auth_source} → {registration_token, expires_in, ...};
-  3) письмо с 6-значным OTP;
-  4) POST /auth/register/verify {registration_token, otp} → пользователь
-     + Set-Cookie сессии;
-  5) проверка: страница вакансии с этой cookie — наш парсер видит контакт?;
-  6) секреты в репозиторий; на экране — только вердикты и маски.
+Временный ящик mail.tm (POST /accounts) с IP раннеров блокируется (422), поэтому
+ящик готовится заранее из окружения с чистым IP и передаётся секретами:
+  REG_EMAIL     — адрес временного ящика mail.tm;
+  REG_MAILTOKEN — Bearer-токен API mail.tm для чтения писем.
+Если секреты не заданы — пытаемся создать ящик сами (вдруг запуск с чистого IP),
+с ретраями и печатью тела ошибки.
 
-Позже, когда сессия истечёт, аккаунт можно «оживить»: логин
-POST /auth/login {email, password} → новая cookie (скрипт refresh_cookie.py).
+Схема (из JS-бандла сайта):
+  1) POST /auth/register/start {name, email, password, password_confirmation,
+     locale, auth_source} → {registration_token, expires_in, ...};
+  2) письмо с 6-значным OTP на ящик;
+  3) POST /auth/register/verify {registration_token, otp} → пользователь
+     + Set-Cookie сессии;
+  4) проверка: страница вакансии с этой cookie — наш парсер видит контакт?;
+  5) секреты в репозиторий; на экране — только вердикты и маски.
 """
 from __future__ import annotations
 
@@ -62,30 +65,46 @@ def _rand(n: int) -> str:
 # --------------------------------------------------------------------- mail.tm
 
 class TempMail:
-    """Временный ящик через публичный API mail.tm."""
+    """Чтение писем временного ящика mail.tm.
+
+    Ящик либо уже создан снаружи (секреты REG_EMAIL/REG_MAILTOKEN — почта
+    создаётся с IP вне блокировки), либо создаём сами с ретраями.
+    """
 
     def __init__(self) -> None:
-        self.address = ""
+        self.address = os.environ.get("REG_EMAIL", "")
+        self.token = os.environ.get("REG_MAILTOKEN", "")
         self.password = ""
-        self.token = ""
         self.account_id = ""
+        self._created_here = False
 
-    async def create(self) -> None:
+    async def ensure(self) -> None:
+        if self.address and self.token:
+            print(f"  ящик из секретов: {self.address[:9]}*** — готов")
+            return
+        print("  секретов REG_EMAIL/REG_MAILTOKEN нет — создаю ящик сам (mail.tm)")
         async with httpx.AsyncClient(timeout=20.0) as c:
             r = await c.get("https://api.mail.tm/domains")
             r.raise_for_status()
             domain = r.json()["hydra:member"][0]["domain"]
-            self.address = f"hirify{_rand(6).lower()}@{domain}"
-            self.password = _rand(16)
-            r = await c.post("https://api.mail.tm/accounts",
-                             json={"address": self.address, "password": self.password})
-            r.raise_for_status()
-            self.account_id = r.json()["id"]
-            r = await c.post("https://api.mail.tm/token",
-                             json={"address": self.address, "password": self.password})
-            r.raise_for_status()
-            self.token = r.json()["token"]
-        print(f"  временный ящик: {self.address[:7]}***@{domain} — готов")
+            for attempt in range(4):
+                self.address = f"hirify{_rand(6).lower()}@{domain}"
+                self.password = _rand(16)
+                r = await c.post("https://api.mail.tm/accounts",
+                                json={"address": self.address, "password": self.password})
+                if r.status_code == 201:
+                    self.account_id = r.json()["id"]
+                    r = await c.post("https://api.mail.tm/token",
+                                     json={"address": self.address, "password": self.password})
+                    r.raise_for_status()
+                    self.token = r.json()["token"]
+                    self._created_here = True
+                    print(f"  ящик создан: {self.address[:7]}***@{domain} (попытка {attempt + 1})")
+                    return
+                print(f"  попытка {attempt + 1}: HTTP {r.status_code}: {r.text[:200]}")
+                await asyncio.sleep(3)
+        raise RuntimeError("mail.tm не даёт создать ящик с этого IP "
+                           "(заполните секреты REG_EMAIL/REG_MAILTOKEN)")
 
     async def wait_otp(self) -> str:
         print("  жду письмо с OTP…")
@@ -104,12 +123,14 @@ class TempMail:
                     body = r2.json().get("text") or r2.json().get("html") or ""
                     code = re.search(r"\b(\d{6})\b", body or "")
                     if code:
-                        print(f"  OTP получен (письмо {i + 1}-й проверкой)")
+                        print(f"  OTP получен (на {(i + 1) * OTP_POLL_SEC:.0f}-й секунде)")
                         return code.group(1)
                 print(f"  …писем ещё нет ({(i + 1) * OTP_POLL_SEC:.0f} c)")
         raise RuntimeError("письмо с OTP не пришло")
 
     async def delete(self) -> None:
+        if not self._created_here:
+            return  # ящик создан снаружи — удалять будет владелец секретов
         try:
             async with httpx.AsyncClient(timeout=20.0) as c:
                 await c.delete(f"https://api.mail.tm/accounts/{self.account_id}",
@@ -165,7 +186,7 @@ async def main() -> int:
     ) as c:
 
         section("1. ВРЕМЕННЫЙ ЯЩИК")
-        await mail.create()
+        await mail.ensure()
 
         section("2. POST /auth/register/start")
         r = await c.post(f"{BASE}/auth/register/start", json={
