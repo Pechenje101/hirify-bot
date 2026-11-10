@@ -68,27 +68,23 @@ async def main() -> int:
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=40.0) as c:
         for path in (
-            f"/api/vacancies/{SLUG}",
             f"/api/vacancies/{SLUG}/contacts",
+            f"/api/vacancies/{SLUG}",
             f"/api/vacancies/{SLUG}/original-text",
-            f"/api/vacancies/{SLUG}/similar",
         ):
-            print(f"\n===== GET {path} =====")
+            print(f"\n===== {path} =====")
             try:
                 r = await c.get(API + path, headers=hdrs)
+                if r.status_code == 405:  # метод не тот — пробуем POST
+                    print("  GET -> 405, пробуем POST…")
+                    r = await c.post(API + path, headers=hdrs)
                 print(f"  HTTP {r.status_code}, {len(r.content)} байт, {r.headers.get('content-type','')[:30]}")
-                if r.status_code == 405:
-                    print("  (GET не поддерживается — нужен POST)")
-                    continue
                 try:
                     data = r.json()
                 except Exception:  # noqa: BLE001
-                    print(f"  не JSON: {r.text[:200]!r}")
+                    print(f"  не JSON: {r.text[:300]!r}")
                     continue
-                if isinstance(data, dict) and "contact" in json.dumps(list(data.keys())).lower():
-                    show("BODY", data)
-                else:
-                    show("BODY", data, depth=0 if len(json.dumps(data)) < 3000 else 2)
+                show("BODY", data)
             except Exception as e:  # noqa: BLE001
                 print(f"  ошибка: {e}")
             await asyncio.sleep(1.5)
