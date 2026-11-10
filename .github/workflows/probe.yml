@@ -22,3 +22,11 @@ jobs:
         run: python tools/probe_live.py
       - name: Диагностика API и JS
         run: python tools/probe_api.py
+      - name: Скачать HTML/JS как артефакты
+        run: python tools/probe_deep.py
+      - name: Upload артефактов
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-files
+          path: debug/
+          retention-days: 3
