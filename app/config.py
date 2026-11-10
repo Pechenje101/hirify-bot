@@ -35,25 +35,37 @@ def _get_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class Feed:
-    """Один источник вакансий (лендинг hirify.me с предустановленным фильтром)."""
+    """Один источник вакансий (раздел hirify.me).
 
-    key: str      # короткое имя: remote / global / crypto …
-    label: str    # человекочитаемая метка для карточки и статуса
-    base_url: str # адрес лендинга без query-параметров
+    api_params — дополнительные параметры API-фида раздела
+    (GET /api/vacancies?{api_params}&{feed_params}&page=N):
+      remote  → work_format=remote
+      global  → remote_type=global
+      crypto  → search=crypto (+ клиентская проверка крипто-признаков)
+    """
+
+    key: str          # короткое имя: remote / global / crypto …
+    label: str        # человекочитаемая метка для карточки и статуса
+    base_url: str     # адрес лендинга (HTML-фолбэк и человеческие ссылки)
+    api_params: str = ""  # фильтр раздела для JSON-API
 
 
-# Готовые «разделы» hirify.me. Лендинги — это те же фид-страницы сайта,
-# просто с предустановленным серверным фильтром:
+# Готовые «разделы» hirify.me. Лендинги — те же фид-страницы сайта с
+# предустановленным серверным фильтром (проверено живыми запросами к API):
 #   remote  → «Удалёнка» (полностью удалённые IT-вакансии)
 #   global  → «Глобальная удалёнка» (work from anywhere)
 #   crypto  → «Crypto & Web3» (крипто-индустрия, любой формат)
 #   crypto_remote → пересечение: крипта + удалёнка
 #   all     → общий фид без раздела (прежнее поведение)
 FEED_PRESETS: dict[str, Feed] = {
-    "remote": Feed("remote", "🏠 Удалёнка", "https://hirify.me/remote-it-jobs"),
-    "global": Feed("global", "🌍 Глобальная удалёнка", "https://hirify.me/remote-jobs"),
-    "crypto": Feed("crypto", "🪙 Crypto & Web3", "https://hirify.me/web3-crypto-jobs"),
-    "crypto_remote": Feed("crypto_remote", "🪙🌍 Crypto Remote", "https://hirify.me/web3-crypto-remote-jobs"),
+    "remote": Feed("remote", "🏠 Удалёнка", "https://hirify.me/remote-it-jobs",
+                   api_params="work_format=remote"),
+    "global": Feed("global", "🌍 Глобальная удалёнка", "https://hirify.me/remote-jobs",
+                   api_params="remote_type=global"),
+    "crypto": Feed("crypto", "🪙 Crypto & Web3", "https://hirify.me/web3-crypto-jobs",
+                   api_params="search=crypto"),
+    "crypto_remote": Feed("crypto_remote", "🪙🌍 Crypto Remote", "https://hirify.me/web3-crypto-remote-jobs",
+                           api_params="search=crypto&work_format=remote"),
     "all": Feed("all", "🔎 Все вакансии", "https://hirify.me/"),
 }
 

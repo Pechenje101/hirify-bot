@@ -44,6 +44,11 @@ class HirifyAuthError(HirifyError):
     """Сессия (cookie) не работает: 401/419 — надо перелогиниться."""
 
 
+class HirifyRestrictedError(HirifyError):
+    """Доступ к контактам ограничен (403: премиум/лимит попыток) — финально,
+    ретраить бессмысленно."""
+
+
 class HirifyNotFound(HirifyError):
     """Страница не существует (404/410) — повторять бессмысленно."""
 
@@ -141,6 +146,11 @@ class HirifyClient:
                 if resp.status_code in (401, 419):
                     # сессия не работает: cookie истёк/отозван
                     raise HirifyAuthError(f"сессия не принята (HTTP {resp.status_code})")
+                if resp.status_code == 403:
+                    # «No free attempts remaining. Premium subscription required»
+                    # или «access is restricted»: финальная ситуация для вакансии
+                    raise HirifyRestrictedError(
+                        f"доступ к контактам ограничен (HTTP 403): {resp.text[:120]}")
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", "5"))
                     log.warning("hirify api: 429, жду %.1fs", retry_after)
@@ -215,5 +225,25 @@ class HirifyClient:
         """Прямые контакты вакансии: POST /api/vacancies/<slug>/contacts.
 
         Возвращает {contacts: [{type, value, short_code}], access_type, …}.
-        Значение value — ссылка t.me (юзернейм рекрутера или пост в канале)."""
+        Значение value — юзернейм рекрутера или t.me-ссылка (пост в канале).
+        """
         return await self._api_call("POST", f"/api/vacancies/{slug}/contacts")
+
+    async def fetch_feed_api(self, feed, page: int = 1) -> list[dict]:
+        """Фид раздела из JSON-API: только вакансии с прямыми TG-контактами.
+
+        GET /api/vacancies?{feed.api_params}&{feed_params}&page=N — фильтры
+        работают на сервере (в отличие от query лендинга HTML!). Возвращает
+        список элементов-«карточек» (id, slug, source, work_format, tldr, …;
+        полное описание — отдельным запросом fetch_vacancy).
+        """
+        params = "&".join(
+            p for p in self.cfg.feed_params.split("&")
+            if p and not p.startswith("page=")
+        )
+        q = "&".join(x for x in (feed.api_params, params, f"page={max(1, page)}") if x)
+        data = await self._api_call("GET", f"/api/vacancies?{q}")
+        if isinstance(data, dict):
+            items = data.get("data") or []
+            return items if isinstance(items, list) else []
+        return data if isinstance(data, list) else []

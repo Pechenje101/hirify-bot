@@ -6,8 +6,10 @@ import logging
 import time
 
 from .db import Database
-from .hirify import HirifyAuthError, HirifyClient, HirifyError, HirifyNotFound
-from .parsing import extract_job_links, vacancy_from_api
+from .hirify import (
+    HirifyAuthError, HirifyClient, HirifyError, HirifyNotFound, HirifyRestrictedError,
+)
+from .parsing import vacancy_from_api
 from .sender import VacancySender
 
 log = logging.getLogger("hirify.monitor")
@@ -152,24 +154,28 @@ class Monitor:
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
         stats = self._new_stats()
 
-        # 1) собираем ссылки вакансий из всех активных разделов (лендинги уже
-        #    отфильтрованы на сервере: удалёнка / глобальная / crypto и т.д.)
+        # 1) фид каждого раздела — из JSON-API: только вакансии с прямыми
+        #    TG-контактами, серверная фильтрация (HTML-лендинг такое не умеет)
         links: list[tuple[int, str, str, object]] = []  # (job_id, slug, url, feed)
         for feed in self.cfg.feeds:
-            got_any = False
             for page in range(1, max(1, self.cfg.feed_pages) + 1):
                 try:
-                    html = await self.client.fetch_feed(feed, page)
+                    items = await self.client.fetch_feed_api(feed, page)
                 except HirifyError as e:
                     log.error("Не удалось загрузить фид «%s» (страница %d): %s", feed.key, page, e)
                     break
-                page_links = extract_job_links(html, base_url=self.cfg.hirify_base)
-                links.extend((jid, slug, url, feed) for jid, slug, url in page_links)
-                got_any = got_any or bool(page_links)
-                if len(page_links) < 10:  # на странице мало вакансий — дальше не идём
+                for it in items:
+                    try:
+                        job_id = int(it.get("id") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if not job_id:
+                        continue
+                    full_slug = str(it.get("slug") or "")
+                    short_slug = full_slug.split("-", 1)[1] if "-" in full_slug else full_slug
+                    links.append((job_id, short_slug, f"{self.cfg.hirify_base}/jobs/{full_slug}", feed))
+                if len(items) < 15:  # в странице фида 15 вакансий — дальше пусто
                     break
-            if got_any:
-                log.debug("фид «%s»: собрано", feed.key)
 
         # 2) оставляем только те, что ещё не видели (дедуп по всем разделам сразу;
         #    send_failed/fetch_failed known_job_ids не вернёт — будет ретрай)
@@ -207,6 +213,13 @@ class Monitor:
                 full_slug = f"{job_id}-{slug}"
                 data = await self.client.fetch_vacancy(full_slug)
                 contacts_data = await self.client.fetch_contacts(full_slug)
+            except HirifyRestrictedError as e:
+                # премиум-вакансия или лимит бесплатных просмотров контактов —
+                # ретраить бессмысленно, финализируем без рассылки
+                log.info("job %d: контакты недоступны (403) — пропускаю: %s", job_id, e)
+                self.db.mark_job(job_id, "skipped_restricted")
+                stats["filtered"] += 1
+                continue
             except HirifyNotFound as e:
                 log.warning("Вакансия недоступна (удалена?): %s", e)
                 self.db.mark_job(job_id, "failed")

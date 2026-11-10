@@ -12,13 +12,11 @@ from app.db import Database  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
 from app.parsing import Vacancy  # noqa: E402
 
-FEED_HTML = """
-<html><body>
-  <a href="/jobs/101-senior-solidity-engineer">Solidity</a>
-  <a href="/jobs/102-frontend-developer">Frontend</a>
-  <a href="/jobs/103-no-contact-role">No contact</a>
-</body></html>
-"""
+FEED_ITEMS = [
+    {"id": 101, "slug": "101-senior-solidity-engineer", "source": "telegram"},
+    {"id": 102, "slug": "102-frontend-developer", "source": "telegram"},
+    {"id": 103, "slug": "103-no-contact-role", "source": "telegram"},
+]
 
 
 def vacancy_json(title: str, job_id: int) -> dict:
@@ -68,15 +66,15 @@ VACANCIES = {
 class FakeClient:
     """Вместо httpx: отдаём заготовленные JSON без сети."""
 
-    def __init__(self, feed_html: str, api: dict):
-        self.feed_html = feed_html
+    def __init__(self, feed_items: list, api: dict):
+        self.feed_items = feed_items
         self.api = api
         self.feed_fetches = 0
         self.job_fetches = 0
 
-    async def fetch_feed(self, feed, page: int = 1) -> str:
+    async def fetch_feed_api(self, feed, page: int = 1) -> list:
         self.feed_fetches += 1
-        return self.feed_html if page == 1 else ""
+        return self.feed_items if page == 1 else []
 
     async def fetch_vacancy(self, slug: str) -> dict:
         self.job_fetches += 1
@@ -110,7 +108,7 @@ def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient
     cfg.hirify_feeds = monkeypatch_feeds
     cfg.remote_strict = False
     cfg.crypto_strict = False
-    client = FakeClient(FEED_HTML, VACANCIES)
+    client = FakeClient(FEED_ITEMS, VACANCIES)
     sender = FakeSender()
     # mkdtemp не авто-удаляется: соединение sqlite живёт дольше функции
     tmpdir = tempfile.mkdtemp(prefix="hirify_test_")
@@ -311,7 +309,7 @@ def test_fetch_failure_is_retried_up_to_limit():
             return await super().fetch_vacancy(slug)
 
     mon, _, sender, db = make_monitor()
-    mon.client = FlakyClient(FEED_HTML, VACANCIES)
+    mon.client = FlakyClient(FEED_ITEMS, VACANCIES)
     for _ in range(MAX_FETCH_ATTEMPTS):
         stats = asyncio.run(mon.poll_once(source="test"))
     assert db.job_status(101) == "failed"
@@ -335,7 +333,7 @@ def test_http_404_fails_immediately_without_retries():
             return await super().fetch_vacancy(slug)
 
     mon, _, _, db = make_monitor()
-    mon.client = GoneClient(FEED_HTML, VACANCIES)
+    mon.client = GoneClient(FEED_ITEMS, VACANCIES)
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["failed"] == 1 and stats["fetch_failed"] == 0
     assert db.job_status(101) == "failed"
@@ -354,7 +352,7 @@ def test_expired_session_warns_and_retries_later():
             return await super().fetch_vacancy(slug)
 
     mon, _, sender, db = make_monitor()
-    mon.client = AuthlessClient(FEED_HTML, VACANCIES)
+    mon.client = AuthlessClient(FEED_ITEMS, VACANCIES)
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["fetch_failed"] == 1 and stats["sent"] == 1
     assert db.job_status(101) == "fetch_failed"  # ретрай, когда cookie оживёт
@@ -368,12 +366,34 @@ def test_scam_vacancies_are_skipped():
     scam["is_scam"] = True
     api = dict(VACANCIES)
     api["104-miracle-cto-fund"] = (scam, contacts_json("scam_hr"))
-    feed = FEED_HTML.replace("</body>", '<a href="/jobs/104-miracle-cto-fund">x</a></body>')
+    feed = FEED_ITEMS + [{"id": 104, "slug": "104-miracle-cto-fund", "source": "telegram"}]
     mon, _, sender, db = make_monitor()
     mon.client = FakeClient(feed, api)
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["filtered"] == 1
     assert all(t != "Miracle CTO Fund" for _, t in sender.sent)
+    db.close()
+
+
+def test_premium_vacancies_finalized_without_retry():
+    """403 «премиум/лимит попыток» — финально: без ретраев и рассылки."""
+    from app.hirify import HirifyRestrictedError
+
+    class PremiumClient(FakeClient):
+        async def fetch_contacts(self, slug):
+            if slug.startswith("101"):
+                raise HirifyRestrictedError("доступ ограничен (HTTP 403)")
+            return await super().fetch_contacts(slug)
+
+    mon, _, _, db = make_monitor()
+    premium = PremiumClient(FEED_ITEMS, VACANCIES)
+    mon.client = premium
+    for _ in range(2):
+        stats = asyncio.run(mon.poll_once(source="test"))
+    assert db.job_status(101) == "skipped_restricted"
+    assert db.job_attempts(101) == 0
+    # первый проход открыл все три вакансии, второй — ни одной (все финальны)
+    assert premium.job_fetches == 3
     db.close()
 
 
@@ -386,7 +406,7 @@ def test_channel_post_contact_counts():
             {"type": "telegram", "value": "https://t.me/iGaming_work/5195", "short_code": "1eHg0"}
         ], "access_type": "free_vacancy"},
     )
-    feed = FEED_HTML.replace("</body>", '<a href="/jobs/104-channel-role">x</a></body>')
+    feed = FEED_ITEMS + [{"id": 104, "slug": "104-channel-role", "source": "telegram"}]
     mon, _, sender, db = make_monitor()
     mon.client = FakeClient(feed, chan)
     stats = asyncio.run(mon.poll_once(source="test"))

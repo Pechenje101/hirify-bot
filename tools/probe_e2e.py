@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.cards import render_rich_html  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.db import Database  # noqa: E402
-from app.hirify import HirifyClient  # noqa: E402
-from app.parsing import extract_job_links, vacancy_from_api  # noqa: E402
+from app.hirify import HirifyClient, HirifyRestrictedError  # noqa: E402
+from app.parsing import vacancy_from_api  # noqa: E402
 
 
 async def main() -> int:
@@ -27,20 +27,24 @@ async def main() -> int:
     db = Database(Path(tempfile.mkdtemp(prefix="e2e_")) / "e2e.db")
     try:
         print(f"cookie: {'есть' if client.has_cookie else 'НЕТ'}")
-        html = await client.fetch_feed(cfg.feeds[0], 1)
-        links = extract_job_links(html, base_url=cfg.hirify_base)
-        print(f"фид «{cfg.feeds[0].label}»: {len(links)} вакансий")
-        for job_id, slug, _ in links[:5]:
-            print(f"    {job_id}  {slug}")
+        items = await client.fetch_feed_api(cfg.feeds[0], 1)
+        print(f"фид «{cfg.feeds[0].label}» (API, только прямые TG-контакты): {len(items)} вакансий")
+        for it in items[:5]:
+            print(f"    {it.get('id')}  {it.get('slug')}  [source={it.get('source')}]")
 
         ok = bad = 0
-        for job_id, slug, _ in links[:4]:
-            full = f"{job_id}-{slug}"
-            data = await client.fetch_vacancy(full)
-            contacts = await client.fetch_contacts(full)
+        for it in items[:4]:
+            full = str(it.get("slug"))
+            try:
+                data = await client.fetch_vacancy(full)
+                contacts = await client.fetch_contacts(full)
+            except HirifyRestrictedError as e:
+                print(f"\n== {full} ==\n  контакты за премиумом (403) — пропускаем: {e}")
+                bad += 1
+                continue
             v = vacancy_from_api(data, contacts, cfg.feeds[0].key, cfg.feeds[0].label)
             got = v.has_direct_contact
-            db.add_job(job_id, slug, f"https://hirify.me/jobs/{full}")
+            db.add_job(int(it.get("id") or 0), full, f"https://hirify.me/jobs/{full}")
             print(f"\n== {full} ==")
             print(f"  {v.title!r} · {v.company or '—'} · {v.salary or '—'}")
             print(f"  формат: {v.work_format or '—'} | занятость: {v.employment_type or '—'}")

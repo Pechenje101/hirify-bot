@@ -19,12 +19,13 @@ Telegram-бот на **aiogram 3.31** (Bot API 10.x), который:
 ```
 адаптивный цикл (обычно раз в 5 минут; после находки — повтор через 2 минуты)
  │
- ├─ для каждого раздела из HIRIFY_FEEDS:
- │    GET https://hirify.me/<лендинг>?only_direct_contact=1&contact_types=telegram&sort_by=newest
- │    │   remote  → /remote-it-jobs          (Удалёнка)
- │    │   global  → /remote-jobs             (Глобальная удалёнка)
- │    │   crypto  → /web3-crypto-jobs        (Crypto & Web3)
- │    └─ регекспом достаём ссылки /jobs/<id>-<slug> (устойчиво к вёрстке)
+ ├─ для каждого раздела из HIRIFY_FEEDS — фид из JSON-API:
+ │    GET api.hirify.me/api/vacancies?{фильтр раздела}&only_direct_contact=1
+ │        &contact_types=telegram&sort_by=newest&page=N
+ │    │   remote  → work_format=remote   (Удалёнка)
+ │    │   global  → remote_type=global   (Глобальная удалёнка)
+ │    │   crypto  → search=crypto        (Crypto & Web3)
+ │    └─ сервер сам отдаёт только вакансии с прямыми TG-контактами
  │
  ├─ отбираем те, которых ещё нет в SQLite (дедупликация по всем разделам)
  │
