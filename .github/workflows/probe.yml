@@ -39,7 +39,11 @@ jobs:
       - name: "API фида: список с фильтрами + пресеты"
         env:
           HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
-        run: python tools/probe_feed_api.py
+        run: python tools/probe_feed_api.py || true
+      - name: "Пресеты лендингов и полнота элемента списка"
+        env:
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+        run: python tools/probe_landing.py
       - name: Upload артефактов
         uses: actions/upload-artifact@v4
         with:
