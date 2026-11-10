@@ -1,0 +1,27 @@
+name: refresh
+
+# Обновление сессии hirify.me: повторный вход по HIRIFY_EMAIL/HIRIFY_PASSWORD
+# и запись свежей cookie в секрет HIRIFY_COOKIE. Запуск вручную (workflow_dispatch)
+# и ежемесячная страховка (remember-cookie живёт долго, но не вечно).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 2 * *'
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt pynacl
+      - name: "Обновление HIRIFY_COOKIE (логин по кредам)"
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          HIRIFY_EMAIL: ${{ secrets.HIRIFY_EMAIL }}
+          HIRIFY_PASSWORD: ${{ secrets.HIRIFY_PASSWORD }}
+        run: python tools/refresh_cookie.py

@@ -131,6 +131,13 @@ def _contact_name(c: TGContact) -> str:
     return c.display
 
 
+def _contact_action(primary: TGContact) -> str:
+    """Подпись главной кнопки: личный контакт или пост в канале."""
+    if primary.kind == "channel":
+        return "Открыть контакт (пост в канале)"
+    return "Написать рекрутеру"
+
+
 def _description_paragraphs(text: str, limit: int) -> str:
     """Обрезаем описание до limit и возвращаем готовый текст (БЕЗ экранирования здесь)."""
     text = (text or "").strip()
@@ -208,6 +215,11 @@ def _extra_contacts(v: Vacancy, cap: int = 5) -> list[TGContact]:
 
 def _recruiter_panel_rich(primary: TGContact) -> str:
     """Панель контакта рекрутера (blockquote — подложка с акцентом в клиентах)."""
+    if primary.kind == "channel":
+        return (
+            f"<blockquote>👤 Канал рекрутера: <b>{E(_contact_name(primary))}</b><br/>"
+            f"Кнопка ниже откроет пост с контактами</blockquote>"
+        )
     if primary.kind == "user_id":
         return (
             "<blockquote>👤 <b>Прямой контакт рекрутера</b><br/>"
@@ -279,7 +291,7 @@ def render_rich_html(v: Vacancy, limit: int = 1800) -> str:
     btns: list[str] = []
     if primary:
         btns.append(
-            f'<tg-button type="url" style="success" url="{E(primary.url, quote=True)}">Написать рекрутеру</tg-button>'
+            f'<tg-button type="url" style="success" url="{E(primary.url, quote=True)}">{_contact_action(primary)}</tg-button>'
         )
         if primary.kind == "username":
             btns.append(
@@ -336,7 +348,12 @@ def render_classic_html(v: Vacancy, limit: int = 1600) -> str:
     # контакт — тоже панелью
     primary = v.primary_contact
     if primary:
-        if primary.kind == "username":
+        if primary.kind == "channel":
+            lines.append(
+                f"👤 Канал рекрутера — <b>{E(primary.display)}</b> · "
+                f'<a href="{E(primary.url, quote=True)}">открыть пост с контактами</a>'
+            )
+        elif primary.kind == "username":
             panel = (
                 f"👤 Рекрутер — <b>{E(primary.display)}</b> · "
                 f'<a href="{E(primary.url, quote=True)}">написать в Telegram</a>'
@@ -367,7 +384,8 @@ def inline_keyboard(v: Vacancy):
     if primary:
         row = [
             InlineKeyboardButton(
-                text="✉️ Написать рекрутеру",
+                text="✉️ Открыть контакт (пост в канале)" if primary.kind == "channel"
+                else "✉️ Написать рекрутеру",
                 url=primary.url,
                 style="primary",  # Bot API 9.4+: акцентная синяя кнопка
             )

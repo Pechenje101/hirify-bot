@@ -20,28 +20,57 @@ FEED_HTML = """
 </body></html>
 """
 
-def job_html(title: str, username: str | None) -> str:
-    contact = f'<div class="contacts"><a href="https://t.me/{username}">@{username}</a></div>' if username else ""
-    return f"""<!DOCTYPE html><html><head><title>{title}</title>
-<script type="application/ld+json">
-{{"@type":"JobPosting","title":"{title}","hiringOrganization":{{"name":"Acme"}},
- "datePosted":"2026-11-10","jobLocationType":"TELECOMMUTE"}}
-</script></head><body><h1>{title}</h1>{contact}</body></html>"""
+
+def vacancy_json(title: str, job_id: int) -> dict:
+    """Сырой JSON GET /api/vacancies/{slug} — как отдаёт api.hirify.me."""
+    return {
+        "id": str(job_id),
+        "slug": f"{job_id}-{title.lower().replace(' ', '-')}",
+        "title": title,
+        "original_title": title,
+        "company_title": "Acme",
+        "text": f"<strong>{title}</strong><br/>Мы ищем {title.lower()}. Пишите!",
+        "tldr": "кратко",
+        "work_format": ["remote"],
+        "remote_type": "global",
+        "work_type": "fulltime",
+        "employee_type": ["employment"],
+        "salary": None,
+        "tags": [{"id": 1, "name": "python"}],
+        "regions": [{"id": 1, "code": "russia", "name": "Россия"}],
+        "grades": [],
+        "created_at": "2026-11-10T13:01:11.000000Z",
+        "source": "telegram",
+        "is_scam": False,
+        "is_potential_scam": False,
+    }
 
 
-JOB_PAGES = {
-    "https://hirify.me/jobs/101-senior-solidity-engineer": job_html("Solidity Engineer", "acme_crypto_hr"),
-    "https://hirify.me/jobs/102-frontend-developer": job_html("Frontend Developer", "acme_hr"),
-    "https://hirify.me/jobs/103-no-contact-role": job_html("No Contact Role", None),
+def contacts_json(username: str | None) -> dict:
+    """Ответ POST /api/vacancies/{slug}/contacts."""
+    items = [] if not username else [{
+        "type": "telegram",
+        "value": f"https://t.me/{username}",
+        "short_code": "abc12",
+    }]
+    return {"vacancy_id": 1, "contacts": items, "access_type": "free_vacancy"}
+
+
+VACANCIES = {
+    "101-senior-solidity-engineer": (vacancy_json("Solidity Engineer", 101),
+                                     contacts_json("acme_crypto_hr")),
+    "102-frontend-developer": (vacancy_json("Frontend Developer", 102),
+                               contacts_json("acme_hr")),
+    "103-no-contact-role": (vacancy_json("No Contact Role", 103), contacts_json(None)),
 }
 
 
 class FakeClient:
-    """Вместо httpx: отдаём заготовленный HTML без сети."""
+    """Вместо httpx: отдаём заготовленные JSON без сети."""
 
-    def __init__(self, feed_html: str, job_pages: dict):
+    def __init__(self, feed_html: str, api: dict):
         self.feed_html = feed_html
-        self.job_pages = job_pages
+        self.api = api
         self.feed_fetches = 0
         self.job_fetches = 0
 
@@ -49,9 +78,12 @@ class FakeClient:
         self.feed_fetches += 1
         return self.feed_html if page == 1 else ""
 
-    async def fetch_job(self, url: str) -> str:
+    async def fetch_vacancy(self, slug: str) -> dict:
         self.job_fetches += 1
-        return self.job_pages[url]
+        return self.api[slug][0]
+
+    async def fetch_contacts(self, slug: str) -> dict:
+        return self.api[slug][1]
 
 
 class FakeSender:
@@ -78,7 +110,7 @@ def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient
     cfg.hirify_feeds = monkeypatch_feeds
     cfg.remote_strict = False
     cfg.crypto_strict = False
-    client = FakeClient(FEED_HTML, JOB_PAGES)
+    client = FakeClient(FEED_HTML, VACANCIES)
     sender = FakeSender()
     # mkdtemp не авто-удаляется: соединение sqlite живёт дольше функции
     tmpdir = tempfile.mkdtemp(prefix="hirify_test_")
@@ -189,7 +221,7 @@ def test_subscriber_feed_filter_excludes_other_sections():
     assert sender.sent == []
     # финализированы без бесконечных ретраев
     assert db.job_status(101) == "sent"
-    assert client.job_fetches == 3  # страницы всё равно открыли один раз
+    assert client.job_fetches == 3  # API по каждой всё равно дёрнули один раз
     # вернули «все разделы» — в новом проходе вакансии бы ушли, но они уже known
     db.update_subscriber_settings(1, feeds=None, silent=False)
     stats2 = asyncio.run(mon.poll_once(source="test"))
@@ -268,18 +300,18 @@ def test_failed_send_is_retried_next_poll():
 
 
 def test_fetch_failure_is_retried_up_to_limit():
-    """Сетевой сбой загрузки страницы: до MAX_FETCH_ATTEMPTS попыток, потом failed."""
+    """Сетевой сбой загрузки данных: до MAX_FETCH_ATTEMPTS попыток, потом failed."""
     from app.hirify import HirifyError
     from app.monitor import MAX_FETCH_ATTEMPTS
 
     class FlakyClient(FakeClient):
-        async def fetch_job(self, url):
-            if "101" in url:
+        async def fetch_vacancy(self, slug):
+            if slug.startswith("101"):
                 raise HirifyError("connection timeout")
-            return await super().fetch_job(url)
+            return await super().fetch_vacancy(slug)
 
     mon, _, sender, db = make_monitor()
-    mon.client = FlakyClient(FEED_HTML, JOB_PAGES)
+    mon.client = FlakyClient(FEED_HTML, VACANCIES)
     for _ in range(MAX_FETCH_ATTEMPTS):
         stats = asyncio.run(mon.poll_once(source="test"))
     assert db.job_status(101) == "failed"
@@ -297,13 +329,13 @@ def test_http_404_fails_immediately_without_retries():
     from app.hirify import HirifyNotFound
 
     class GoneClient(FakeClient):
-        async def fetch_job(self, url):
-            if "101" in url:
+        async def fetch_vacancy(self, slug):
+            if slug.startswith("101"):
                 raise HirifyNotFound("HTTP 404")
-            return await super().fetch_job(url)
+            return await super().fetch_vacancy(slug)
 
     mon, _, _, db = make_monitor()
-    mon.client = GoneClient(FEED_HTML, JOB_PAGES)
+    mon.client = GoneClient(FEED_HTML, VACANCIES)
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["failed"] == 1 and stats["fetch_failed"] == 0
     assert db.job_status(101) == "failed"
@@ -311,8 +343,59 @@ def test_http_404_fails_immediately_without_retries():
     db.close()
 
 
+def test_expired_session_warns_and_retries_later():
+    """401 от API: вакансия остаётся на ретрай, подписчику уходит подсказка."""
+    from app.hirify import HirifyAuthError
+
+    class AuthlessClient(FakeClient):
+        async def fetch_vacancy(self, slug):
+            if slug.startswith("101"):
+                raise HirifyAuthError("сессия не принята (HTTP 401)")
+            return await super().fetch_vacancy(slug)
+
+    mon, _, sender, db = make_monitor()
+    mon.client = AuthlessClient(FEED_HTML, VACANCIES)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["fetch_failed"] == 1 and stats["sent"] == 1
+    assert db.job_status(101) == "fetch_failed"  # ретрай, когда cookie оживёт
+    assert sender.texts  # подсказка про cookie отправлена админу
+    db.close()
+
+
+def test_scam_vacancies_are_skipped():
+    """Помеченные сайтом как скам не рассылаем."""
+    scam = vacancy_json("Miracle CTO Fund", 104)
+    scam["is_scam"] = True
+    api = dict(VACANCIES)
+    api["104-miracle-cto-fund"] = (scam, contacts_json("scam_hr"))
+    feed = FEED_HTML.replace("</body>", '<a href="/jobs/104-miracle-cto-fund">x</a></body>')
+    mon, _, sender, db = make_monitor()
+    mon.client = FakeClient(feed, api)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["filtered"] == 1
+    assert all(t != "Miracle CTO Fund" for _, t in sender.sent)
+    db.close()
+
+
+def test_channel_post_contact_counts():
+    """Контакт-пост в канале — тоже прямой контакт: вакансия уходит."""
+    chan = dict(VACANCIES)
+    chan["104-channel-role"] = (
+        vacancy_json("Channel Only Role", 104),
+        {"vacancy_id": 104, "contacts": [
+            {"type": "telegram", "value": "https://t.me/iGaming_work/5195", "short_code": "1eHg0"}
+        ], "access_type": "free_vacancy"},
+    )
+    feed = FEED_HTML.replace("</body>", '<a href="/jobs/104-channel-role">x</a></body>')
+    mon, _, sender, db = make_monitor()
+    mon.client = FakeClient(feed, chan)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 3
+    db.close()
+
+
 def test_no_subscribers_no_job_fetching():
-    """Без подписчиков страницы вакансий не открываем (экономим запросы к сайту)."""
+    """Без подписчиков API вакансий не дёргаем (экономим запросы к сайту)."""
     mon, client, _, db = make_monitor()
     db.remove_subscriber(1)
     stats = asyncio.run(mon.poll_once(source="test"))

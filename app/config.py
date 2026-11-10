@@ -106,6 +106,8 @@ class Config:
         ).lstrip("?")
     )
     hirify_base: str = field(default_factory=lambda: os.getenv("HIRIFY_BASE", "https://hirify.me").rstrip("/"))
+    # JSON-API сайта (Laravel Sanctum, отдельный домен): вакансии и контакты
+    hirify_api_base: str = field(default_factory=lambda: os.getenv("HIRIFY_API_BASE", "https://api.hirify.me").rstrip("/"))
 
     # Строгая клиентская проверка поверх серверных лендингов:
     # remote_strict  — выкидывать вакансию, если на её странице явно указан

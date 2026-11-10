@@ -1,4 +1,8 @@
-"""HTTP-клиент hirify.me: фид вакансий и страницы вакансий (с cookie-авторизацией)."""
+"""HTTP-клиент hirify.me: фид вакансий (HTML) + JSON-API вакансий и контактов
+(с cookie-авторизацией). API живёт на отдельном домене api.hirify.me и
+использует Laravel Sanctum: POST-запросам нужен заголовок X-XSRF-TOKEN
+из cookie XSRF-TOKEN, а также Origin/Referer нашего сайта.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +10,7 @@ import logging
 import random
 import time
 from typing import Optional
+from urllib.parse import unquote
 
 import httpx
 
@@ -33,6 +38,10 @@ BROWSER_HEADERS = {
 
 class HirifyError(Exception):
     """Общая ошибка при обращении к hirify.me."""
+
+
+class HirifyAuthError(HirifyError):
+    """Сессия (cookie) не работает: 401/419 — надо перелогиниться."""
 
 
 class HirifyNotFound(HirifyError):
@@ -91,6 +100,69 @@ class HirifyClient:
             h["Cookie"] = self.cookie
         return h
 
+    def _api_headers(self, post: bool = False) -> dict:
+        """Заголовки для JSON-API api.hirify.me (Laravel Sanctum).
+
+        POST-эндпоинтам нужен X-XSRF-TOKEN — расшифрованное значение cookie
+        XSRF-TOKEN (как делает фронтенд сайта), иначе сервер ответит 419.
+        """
+        h = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Referer": "https://hirify.me/jobs/",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+        if self.cookie:
+            h["Cookie"] = self.cookie
+            if post:
+                for part in self.cookie.split(";"):
+                    k, _, val = part.strip().partition("=")
+                    if k == "XSRF-TOKEN":
+                        h["X-XSRF-TOKEN"] = unquote(val)
+                        break
+        return h
+
+    async def _api_call(self, method: str, path: str) -> dict:
+        """GET/POST к api.hirify.me с общими ретраями и обработкой статусов."""
+        assert self._client is not None, "Клиент не открыт — вызовите open()"
+        await self._throttle()
+        url = self.cfg.hirify_api_base + path
+        last_status: int | None = None
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await self._client.request(
+                    method, url, headers=self._api_headers(post=(method == "POST")))
+                last_status = resp.status_code
+                if resp.status_code in (404, 410):
+                    raise HirifyNotFound(f"hirify вернул HTTP {resp.status_code} для {url}")
+                if resp.status_code in (401, 419):
+                    # сессия не работает: cookie истёк/отозван
+                    raise HirifyAuthError(f"сессия не принята (HTTP {resp.status_code})")
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", "5"))
+                    log.warning("hirify api: 429, жду %.1fs", retry_after)
+                    await asyncio.sleep(min(retry_after + 1.0, 60.0))
+                    continue
+                if resp.status_code in (502, 503, 504):
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                if resp.status_code != 200:
+                    raise HirifyError(
+                        f"hirify вернул HTTP {resp.status_code} для {url}: "
+                        f"{resp.text[:120]}")
+                try:
+                    return resp.json()
+                except ValueError as e:
+                    raise HirifyError(f"api.hirify.me вернул не JSON: {e}") from e
+            except httpx.HTTPError as e:  # network / timeout
+                last_err = e
+                await asyncio.sleep(1.5 * (attempt + 1))
+        detail = f"HTTP {last_status}" if last_status is not None else last_err
+        raise HirifyError(f"Не удалось загрузить {url}: {detail}")
+
     async def _get(self, url: str) -> str:
         assert self._client is not None, "Клиент не открыт — вызовите open()"
         await self._throttle()
@@ -128,6 +200,20 @@ class HirifyClient:
         return await self._get(self.cfg.feed_url_for_page(feed, page))
 
     async def fetch_job(self, job_url: str) -> str:
-        """HTML страницы вакансии /jobs/<id>-<slug>."""
+        """HTML страницы вакансии /jobs/<id>-<slug> (legacy-путь, живёт для
+        инструментов диагностики; монитор использует fetch_vacancy/fetch_contacts)."""
         url = job_url if job_url.startswith("http") else self.cfg.hirify_base + job_url
         return await self._get(url)
+
+    # ---------- JSON-API (api.hirify.me) ----------
+
+    async def fetch_vacancy(self, slug: str) -> dict:
+        """Данные вакансии: GET /api/vacancies/<slug> (требует сессию)."""
+        return await self._api_call("GET", f"/api/vacancies/{slug}")
+
+    async def fetch_contacts(self, slug: str) -> dict:
+        """Прямые контакты вакансии: POST /api/vacancies/<slug>/contacts.
+
+        Возвращает {contacts: [{type, value, short_code}], access_type, …}.
+        Значение value — ссылка t.me (юзернейм рекрутера или пост в канале)."""
+        return await self._api_call("POST", f"/api/vacancies/{slug}/contacts")

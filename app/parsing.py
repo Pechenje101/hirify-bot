@@ -54,7 +54,12 @@ class Vacancy:
 
     @property
     def has_direct_contact(self) -> bool:
-        return any(c.is_personal for c in self.contacts)
+        """Есть ли способ связаться: личный юзернейм/айди ИЛИ пост-контакт в канале.
+
+        Для TG-вакансий hirify «прямым контактом» часто выступает пост в канале
+        рекрутера (там лежит ссылка на него) — это тоже рабочий канал связи.
+        """
+        return any(c.is_personal or c.kind == "channel" for c in self.contacts)
 
     @property
     def is_crypto(self) -> bool:
@@ -74,15 +79,22 @@ class Vacancy:
 
     @property
     def primary_contact(self) -> Optional[TGContact]:
+        """Основной контакт: сначала личные (юзернейм/айди), затем пост в канале.
+
+        Приоритет внутри типа: найденный в блоке контактов → ссылка → упоминание.
+        """
+        def _pick(pool: list[TGContact]) -> Optional[TGContact]:
+            for pref in ("contacts", "body", "mention"):
+                for c in pool:
+                    if c.source == pref:
+                        return c
+            return pool[0] if pool else None
+
         personal = [c for c in self.contacts if c.is_personal]
-        if not personal:
-            return None
-        # приоритет: найденный в блоке контактов, затем ссылка, затем упоминание
-        for pref in ("contacts", "body", "mention"):
-            for c in personal:
-                if c.source == pref:
-                    return c
-        return personal[0]
+        if personal:
+            return _pick(personal)
+        channels = [c for c in self.contacts if c.kind == "channel"]
+        return _pick(channels)
 
 
 # ------------------------------------------------------------------ регекспы
@@ -116,11 +128,11 @@ MENTION_BLOCKLIST = {
     "inject", "autowired", "component_scan", "configuration", "controller",
     "everyone", "here", "channel", "admin", "support", "moderator",
 }
-# сервисные ссылки самого hirify (промо-каналы и саппорт-бот) — не рекрутеры;
+# сервисные ссылки самого hirify (промо-каналы и боты) — не рекрутеры;
 # @hirify_support_bot встречается на каждой странице вакансии (подвал «Help»)
 HIRIFY_USERNAMES = {
     "hirify", "hirify_jobs", "hirifybot", "hirify_support_bot",
-    "hirify_support", "hirify_global",
+    "hirify_support", "hirify_global", "hirifyme_bot", "hirify_me",
 }
 
 # Крипто-индустрия: заголовок/навыки/описание/компания.
@@ -483,4 +495,143 @@ def parse_job_page(html: str, url: str) -> Vacancy:
         merged.append(c)
     v.contacts = merged
 
+    return v
+
+
+# ------------------------------------------------------------------ API hirify.me
+# Основные данные вакансии бот теперь берёт из официального JSON-API
+# (api.hirify.me/api/vacancies/{slug}) — это надёжнее парсинга HTML: страница
+# hirify.me рендерится клиентским JS, а API отдаёт всё разом.
+
+SALARY_UNITS = {
+    "month": "/мес", "MONTH": "/мес",
+    "year": "/год", "YEAR": "/год",
+    "hour": "/час", "HOUR": "/час",
+    "week": "/нед", "WEEK": "/нед",
+    "day": "/день", "DAY": "/день",
+}
+
+
+def _salary_from_api(s) -> str:
+    """Зарплата из JSON-API: словарь {min/max/from/to, currency, period/…}."""
+    if not isinstance(s, dict):
+        return ""
+    lo = s.get("min") if s.get("min") is not None else s.get("min_value", s.get("from"))
+    hi = s.get("max") if s.get("max") is not None else s.get("max_value", s.get("to"))
+    cur = _first(s.get("currency"), s.get("currency_code"))
+    unit = _first(s.get("period"), s.get("unit"), s.get("unit_text"))
+    try:
+        lo_i = int(float(lo)) if lo is not None else None
+        hi_i = int(float(hi)) if hi is not None else None
+    except (TypeError, ValueError):
+        return ""
+    fmt = lambda n: f"{n:,}".replace(",", " ")  # noqa: E731
+    if lo_i and hi_i:
+        out = f"{fmt(lo_i)} – {fmt(hi_i)}"
+    elif lo_i:
+        out = f"от {fmt(lo_i)}"
+    elif hi_i:
+        out = f"до {fmt(hi_i)}"
+    else:
+        return ""
+    suffix = (f" {cur}".rstrip() if cur else "") + SALARY_UNITS.get(str(unit), "")
+    return (out + suffix).strip()
+
+
+def _api_tags(data: dict) -> list[str]:
+    """Теги-навыки: [{'id':…,'name':'igaming'}, …] или строки."""
+    out: list[str] = []
+    for t in data.get("tags") or []:
+        if isinstance(t, dict):
+            name = t.get("name")
+            if name:
+                out.append(str(name))
+        elif isinstance(t, str) and t.strip():
+            out.append(t.strip())
+    for t in data.get("nice_to_have_tags") or []:
+        if isinstance(t, str) and t.strip():
+            out.append(t.strip())
+    return out
+
+
+def _api_contacts(contacts_data: dict) -> list[TGContact]:
+    """Контакты из ответа POST /api/vacancies/{slug}/contacts.
+
+    Значения — ссылки t.me: /username (личный) или /channel/123 (пост
+    рекрутера в канале — для TG-вакансий это и есть «прямой контакт»).
+    """
+    out: list[TGContact] = []
+    for c in (contacts_data or {}).get("contacts") or []:
+        val = str(c.get("value") or "").strip()
+        if not val:
+            continue
+        m = TELEGRAM_LINK_RE.search(val)
+        if m:
+            username = _clean_username(m.group(1))
+            rest = (m.group(2) or "").strip()
+            low = username.lower()
+            if low in HIRIFY_USERNAMES or low in TG_SERVICE_PATHS or low in MENTION_BLOCKLIST:
+                continue
+            if rest:
+                out.append(TGContact("channel", username + rest, f"@{username}",
+                                     f"https://t.me/{username}{rest}", "contacts"))
+            else:
+                out.append(TGContact("username", username, f"@{username}",
+                                     f"https://t.me/{username}", "contacts"))
+        elif val.isdigit():
+            out.append(TGContact("user_id", val, f"tg://user?id={val}",
+                                 f"tg://user?id={val}", "contacts"))
+        elif str(c.get("type", "")).lower() == "telegram" and val.lstrip("@"):
+            handle = val.lstrip("@")
+            out.append(TGContact("username", handle, f"@{handle}",
+                                f"https://t.me/{handle}", "contacts"))
+    return out
+
+
+def vacancy_from_api(data: dict, contacts_data: dict,
+                      feed_key: str = "", feed_label: str = "") -> Vacancy:
+    """Собирает Vacancy из JSON GET /api/vacancies/{slug} + POST …/contacts."""
+    slug = str(data.get("slug") or "")
+    try:
+        job_id = int(data.get("id") or slug.split("-")[0])
+    except (TypeError, ValueError):
+        job_id = 0
+    v = Vacancy(job_id=job_id, slug=slug, url=f"https://hirify.me/jobs/{slug}")
+
+    v.title = _first(data.get("title"), data.get("original_title"))
+    v.company = _first(data.get("company_title"))
+
+    # формат работы: список ['remote'] (+ remote_type: global/…) → строка
+    wf = data.get("work_format")
+    if isinstance(wf, list):
+        v.work_format = ", ".join(x for x in wf if x)
+    else:
+        v.work_format = _first(wf)
+    rt = data.get("remote_type")
+    if rt and "remote" in (v.work_format or "").lower():
+        v.work_format = f"{v.work_format} · {rt}"
+
+    emp = [data.get("work_type") or ""]
+    et = data.get("employee_type")
+    if isinstance(et, list):
+        emp.extend(x for x in et if x)
+    v.employment_type = ", ".join(x for x in emp if x).strip(" ,")
+
+    # грейд: список словарей/строк
+    grades = data.get("grades") or []
+    names = [str(g.get("name") or g) for g in grades if isinstance(g, (dict, str))]
+    v.grade = _first(*names[:1]) if names else ""
+
+    regions = data.get("regions") or []
+    if isinstance(regions, list) and regions and isinstance(regions[0], dict):
+        v.location = ", ".join(x for x in (r.get("name") for r in regions if isinstance(r, dict)) if x)
+
+    v.salary = _salary_from_api(data.get("salary"))
+    v.skills = _api_tags(data)[:14]
+    v.description = _clean_description(data.get("text") or "")
+    v.date_posted = str(data.get("created_at") or "")[:10]
+    v.source_type = _first(data.get("source"))
+    v.contacts = _api_contacts(contacts_data)
+    v.contacts_hidden = False  # контакты получены авторизованно из API
+    v.feed_key, v.feed_label = feed_key, feed_label
     return v

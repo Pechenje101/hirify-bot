@@ -96,20 +96,24 @@ def _head_line(v: Vacancy) -> str:
 
 
 def _buttons_html(v: Vacancy) -> str:
-    """Кнопки-действия внутри виджета. Только для @username-контактов:
-    openTelegramLink понимает лишь https://t.me/…, а tg://user?id= — нет,
-    такие контакты открывает инлайн-клавиатура под виджетом (sender.py)."""
+    """Кнопки-действия внутри виджета. openTelegramLink понимает лишь
+    https://t.me/…: подходит и юзернейм, и пост в канале (t.me/channel/123);
+    а tg://user?id= — нет, такие контакты открывает инлайн-клавиатура
+    под виджетом (sender.py)."""
     primary = v.primary_contact
-    if not primary or primary.kind != "username":
+    if not primary or primary.kind not in ("username", "channel"):
         return ""
     url = _js_arg(primary.url)
-    handle = _js_arg(primary.display)
     btns = [
         f'<button class="cta" onclick="TelegramWidget.openTelegramLink(\'{url}\')">'
         f"✉️ Написать рекрутеру</button>",
-        f'<button class="cp" onclick="TelegramWidget.copyText(\'{handle}\')">'
-        f"📋 Копировать контакт</button>",
     ]
+    if primary.kind == "username":
+        handle = _js_arg(primary.display)
+        btns.append(
+            f'<button class="cp" onclick="TelegramWidget.copyText(\'{handle}\')">'
+            f"📋 Копировать контакт</button>",
+        )
     return '<div class="bs">' + "".join(btns) + "</div>"
 
 
@@ -117,7 +121,9 @@ def _recruiter_panel(v: Vacancy) -> str:
     primary = v.primary_contact
     if not primary:
         return ""
-    if primary.kind == "user_id":
+    if primary.kind == "channel":
+        title, value = "Канал рекрутера", f"{_contact_name(primary)} (пост — по кнопке)"
+    elif primary.kind == "user_id":
         title, value = "Прямой контакт рекрутера", "откроется кнопкой под карточкой"
     else:
         title, value = "Рекрутер", _contact_name(primary)

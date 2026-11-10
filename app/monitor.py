@@ -6,8 +6,8 @@ import logging
 import time
 
 from .db import Database
-from .hirify import HirifyClient, HirifyError, HirifyNotFound
-from .parsing import extract_job_links, parse_job_page
+from .hirify import HirifyAuthError, HirifyClient, HirifyError, HirifyNotFound
+from .parsing import extract_job_links, vacancy_from_api
 from .sender import VacancySender
 
 log = logging.getLogger("hirify.monitor")
@@ -201,12 +201,25 @@ class Monitor:
             self.db.add_job(job_id, slug, url)
             stats["total"] += 1
             try:
-                html = await self.client.fetch_job(url)
-                v = parse_job_page(html, url)
+                # данные и контакты — из JSON-API (страницы вакансий рендерит
+                # клиентский JS, парсить их бессмысленно; API отдаёт всё разом).
+                # Слаг в фиде хранится без числового префикса — API ждёт полный.
+                full_slug = f"{job_id}-{slug}"
+                data = await self.client.fetch_vacancy(full_slug)
+                contacts_data = await self.client.fetch_contacts(full_slug)
             except HirifyNotFound as e:
                 log.warning("Вакансия недоступна (удалена?): %s", e)
                 self.db.mark_job(job_id, "failed")
                 stats["failed"] += 1
+                continue
+            except HirifyAuthError as e:
+                # сессия не работает: без неё контакты не получить — предупредим
+                # админа и оставим вакансию на ретрай (когда cookie оживёт)
+                log.error("Сессия hirify.me не принимается (%s) — обновите cookie", e)
+                stats["cookie_warn"] = True
+                self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
+                self.db.mark_job(job_id, "fetch_failed")
+                stats["fetch_failed"] += 1
                 continue
             except HirifyError as e:
                 # сеть/таймаут/5xx — попробуем в следующем проходе (до MAX_FETCH_ATTEMPTS)
@@ -220,26 +233,27 @@ class Monitor:
                 log.warning("Не удалось загрузить %s (попытка %d/%d): %s",
                             url, attempts, MAX_FETCH_ATTEMPTS, e)
                 continue
-            except Exception as e:  # noqa: BLE001 — битая вёрстка/JSON — навсегда
-                log.warning("Не удалось распарсить %s: %s", url, e)
-                self.db.mark_job(job_id, "failed")
-                stats["failed"] += 1
+
+            # помеченные сайтом как скам/подозрительные — не рассылаем
+            if data.get("is_scam") or data.get("is_potential_scam"):
+                self.db.mark_job(job_id, "skipped_scam")
+                stats["filtered"] += 1
+                log.info("job %d: помечен как скам — пропускаю", job_id)
                 continue
 
-            v.feed_key, v.feed_label = feed.key, feed.label
+            v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
             self.db.update_job_parsed(
                 job_id, title=v.title, company=v.company, salary=v.salary,
                 tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
             )
 
             # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
+            # (фид уже фильтрует only_direct_contact — это страховка; проблемы
+            # с самой сессией ловятся выше как HirifyAuthError)
             if not v.has_direct_contact:
                 self.db.mark_job(job_id, "skipped_no_contact")
                 stats["skipped"] += 1
                 log.debug("job %d: TG-контакта нет — пропускаю", job_id)
-                if v.contacts_hidden:
-                    stats["cookie_warn"] = True
-                    self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
                 continue
 
             # ФИЛЬТР 2: строгая проверка раздела (страховка поверх серверных лендингов)
