@@ -24,6 +24,10 @@ jobs:
         run: python tools/probe_api.py
       - name: Скачать HTML/JS как артефакты
         run: python tools/probe_deep.py
+      - name: Чанки: поиск API вакансий + проверка с cookie
+        env:
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+        run: python tools/probe_chunks.py
       - name: Upload артефактов
         uses: actions/upload-artifact@v4
         with:
