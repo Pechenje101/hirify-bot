@@ -5,21 +5,19 @@
 в логи/артефакты: из скрипта они уходят напрямую в секреты репозитория
 (HIRIFY_COOKIE / HIRIFY_EMAIL / HIRIFY_PASSWORD) через GitHub API (sealed box).
 
-Временный ящик mail.tm (POST /accounts) с IP раннеров блокируется (422), поэтому
-ящик готовится заранее из окружения с чистым IP и передаётся секретами:
-  REG_EMAIL     — адрес временного ящика mail.tm;
-  REG_MAILTOKEN — Bearer-токен API mail.tm для чтения писем.
-Если секреты не заданы — пытаемся создать ящик сами (вдруг запуск с чистого IP),
-с ретраями и печатью тела ошибки.
-
-Схема (из JS-бандла сайта):
-  1) POST /auth/register/start {name, email, password, password_confirmation,
-     locale, auth_source} → {registration_token, expires_in, ...};
-  2) письмо с 6-значным OTP на ящик;
-  3) POST /auth/register/verify {registration_token, otp} → пользователь
-     + Set-Cookie сессии;
-  4) проверка: страница вакансии с этой cookie — наш парсер видит контакт?;
-  5) секреты в репозиторий; на экране — только вердикты и маски.
+Схема (из runtime-конфига и JS-бандла сайта):
+  * apiBase = https://api.hirify.me — отдельный API-домен (Laravel Sanctum);
+  * временный ящик mail.tm (POST /accounts с IP раннеров блокируется — ящик
+    создаётся заранее и передаётся секретами REG_EMAIL / REG_MAILTOKEN);
+  * 1) GET  {api}/sanctum/csrf-cookie → cookie XSRF-TOKEN (+ сессия);
+    2) POST {api}/auth/register/start {name, email, password,
+       password_confirmation, locale, auth_source} с X-XSRF-TOKEN и Origin;
+    3) письмо с 6-значным OTP на ящик;
+    4) POST {api}/auth/register/verify {registration_token, otp} →
+       пользователь + Set-Cookie сессии (домен .hirify.me);
+  * проверка: страница вакансии на hirify.me с этой cookie — наш парсер
+    видит контакт рекрутера? фид с фильтром выдаёт вакансии с контактами?;
+  * секреты в репозиторий; на экране — только вердикты и маски.
 """
 from __future__ import annotations
 
@@ -33,6 +31,7 @@ import string
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -43,9 +42,10 @@ from app.parsing import extract_job_links, parse_job_page  # noqa: E402
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-BASE = "https://hirify.me"
-JOB_TG_SOURCE = f"{BASE}/jobs/1342174-telegram-outreach-manager-igaming"
-FEED_URL = (f"{BASE}/remote-it-jobs?only_direct_contact=1"
+SITE = "https://hirify.me"           # Nuxt-сайт (страницы вакансий)
+API = "https://api.hirify.me"        # Laravel API (auth)
+JOB_TG_SOURCE = f"{SITE}/jobs/1342174-telegram-outreach-manager-igaming"
+FEED_URL = (f"{SITE}/remote-it-jobs?only_direct_contact=1"
             "&contact_types=telegram&sort_by=newest&page=1")
 
 OTP_TIMEOUT_SEC = 240
@@ -67,8 +67,8 @@ def _rand(n: int) -> str:
 class TempMail:
     """Чтение писем временного ящика mail.tm.
 
-    Ящик либо уже создан снаружи (секреты REG_EMAIL/REG_MAILTOKEN — почта
-    создаётся с IP вне блокировки), либо создаём сами с ретраями.
+    Ящик либо уже создан снаружи (секреты REG_EMAIL/REG_MAILTOKEN), либо
+    создаём сами с ретраями (IP раннеров mail.tm часто блокирует).
     """
 
     def __init__(self) -> None:
@@ -130,7 +130,7 @@ class TempMail:
 
     async def delete(self) -> None:
         if not self._created_here:
-            return  # ящик создан снаружи — удалять будет владелец секретов
+            return  # ящик создан снаружи — удаляет владелец секретов
         try:
             async with httpx.AsyncClient(timeout=20.0) as c:
                 await c.delete(f"https://api.mail.tm/accounts/{self.account_id}",
@@ -176,27 +176,34 @@ async def main() -> int:
             "User-Agent": UA,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "Origin": BASE,
-            "Referer": BASE + "/",
-            "Sec-Fetch-Site": "same-origin",
+            "Origin": SITE,
+            "Referer": SITE + "/",
+            "Sec-Fetch-Site": "same-site",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
         follow_redirects=True, timeout=40.0,
     ) as c:
 
+        section("0. CSRF-COOKIE (Laravel Sanctum)")
+        r = await c.get(f"{API}/sanctum/csrf-cookie")
+        print(f"  GET {API}/sanctum/csrf-cookie -> HTTP {r.status_code}")
+        xsrf = c.cookies.get("XSRF-TOKEN", "")
+        print(f"  XSRF-TOKEN: {'получен' if xsrf else 'НЕТ'}")
+        auth_headers = {"X-XSRF-TOKEN": unquote(xsrf)} if xsrf else {}
+
         section("1. ВРЕМЕННЫЙ ЯЩИК")
         await mail.ensure()
 
         section("2. POST /auth/register/start")
-        r = await c.post(f"{BASE}/auth/register/start", json={
+        r = await c.post(f"{API}/auth/register/start", json={
             "name": ACCOUNT_NAME,
             "email": mail.address,
             "password": hirify_pass,
             "password_confirmation": hirify_pass,
             "locale": "ru",
             "auth_source": "site",
-        })
+        }, headers=auth_headers)
         print(f"  HTTP {r.status_code}")
         if r.status_code != 200:
             print(f"  ответ: {r.text[:400]}")
@@ -208,10 +215,12 @@ async def main() -> int:
         otp = await mail.wait_otp()
 
         section("4. POST /auth/register/verify")
-        r = await c.post(f"{BASE}/auth/register/verify", json={
+        xsrf = c.cookies.get("XSRF-TOKEN", "")
+        auth_headers = {"X-XSRF-TOKEN": unquote(xsrf)} if xsrf else {}
+        r = await c.post(f"{API}/auth/register/verify", json={
             "registration_token": rt,
             "otp": otp,
-        })
+        }, headers=auth_headers)
         print(f"  HTTP {r.status_code}")
         if r.status_code != 200:
             print(f"  ответ: {r.text[:400]}")
@@ -220,15 +229,19 @@ async def main() -> int:
         print(f"  пользователь: id={user.get('id')}, email={user.get('email', '')[:3]}***")
 
         cookie = "; ".join(f"{k}={v}" for k, v in c.cookies.items())
-        print(f"  cookie сессии: {len(cookie)} символов, "
-              f"ключи: {sorted(c.cookies.keys())}")
+        domains = sorted({c2.domain for c2 in c.cookies.jar})
+        print(f"  cookie: {len(cookie)} символов; ключи: {sorted(c.cookies.keys())}")
+        print(f"  домены cookie: {domains}")
 
         section("5. ПРОВЕРКА: контакты видны с этой cookie?")
+        # страницу вакансии читаем на САЙТЕ (hirify.me), cookie шлём вручную —
+        # как это делает бот (HirifyClient подставляет сырую строку Cookie)
         r = await c.get(JOB_TG_SOURCE, headers={
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "Referer": BASE + "/",
+            "Referer": SITE + "/",
+            "Cookie": cookie,
         })
         print(f"  GET вакансия (tg-источник) -> HTTP {r.status_code}")
         v = parse_job_page(r.text, JOB_TG_SOURCE)
@@ -242,9 +255,10 @@ async def main() -> int:
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "Referer": BASE + "/",
+            "Referer": SITE + "/",
+            "Cookie": cookie,
         })
-        links = extract_job_links(r2.text, base_url=BASE)
+        links = extract_job_links(r2.text, base_url=SITE)
         print(f"  фид с фильтром: HTTP {r2.status_code}, вакансий: {len(links)}")
         for job_id, slug, _ in links[:3]:
             print(f"    {job_id}  {slug}")
