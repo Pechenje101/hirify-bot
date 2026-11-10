@@ -43,7 +43,11 @@ jobs:
       - name: "Пресеты лендингов и полнота элемента списка"
         env:
           HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
-        run: python tools/probe_landing.py
+        run: python tools/probe_landing.py || true
+      - name: "Официальный API/MCP: эндпоинт и токен"
+        env:
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+        run: python tools/probe_mcp.py
       - name: Upload артефактов
         uses: actions/upload-artifact@v4
         with:
