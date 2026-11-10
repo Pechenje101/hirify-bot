@@ -28,6 +28,10 @@ jobs:
         env:
           HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
         run: python tools/probe_chunks.py
+      - name: "API вакансии с cookie: структура JSON"
+        env:
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+        run: python tools/probe_vac_api.py
       - name: Upload артефактов
         uses: actions/upload-artifact@v4
         with:
