@@ -205,7 +205,7 @@ async def main() -> int:
             "auth_source": "site",
         }, headers=auth_headers)
         print(f"  HTTP {r.status_code}")
-        if r.status_code != 200:
+        if r.status_code not in (200, 201):
             print(f"  ответ: {r.text[:400]}")
             raise RuntimeError("register/start не прошёл")
         rt = r.json()["registration_token"]
@@ -222,7 +222,7 @@ async def main() -> int:
             "otp": otp,
         }, headers=auth_headers)
         print(f"  HTTP {r.status_code}")
-        if r.status_code != 200:
+        if r.status_code not in (200, 201):  # Laravel: 201 = Created
             print(f"  ответ: {r.text[:400]}")
             raise RuntimeError("register/verify не прошёл")
         user = r.json()
