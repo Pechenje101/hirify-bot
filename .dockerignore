@@ -1,0 +1,12 @@
+# в образ не попадает: окружение, кэши, локальные данные и секреты
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/
+debug/
+.env
+.git/
+.pytest_cache/
+tools/
+tests/

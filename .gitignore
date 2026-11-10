@@ -1,0 +1,13 @@
+# локальные данные и секреты — в репозиторий не попадают
+.env
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+debug/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

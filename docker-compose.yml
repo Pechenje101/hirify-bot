@@ -1,0 +1,17 @@
+# Запуск:  docker compose up -d --build
+# Логи:    docker compose logs -f hirify-bot
+# Останов: docker compose down
+services:
+  hirify-bot:
+    build: .
+    container_name: hirify-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # SQLite-база переживает пересоздание контейнера
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

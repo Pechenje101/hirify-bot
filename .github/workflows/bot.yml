@@ -1,0 +1,87 @@
+name: bot
+
+# ── Бот «24/7» на GitHub Actions ──────────────────────────────────────────────
+# Job здесь живёт максимум 6 часов, поэтому бот сам плавно останавливается
+# через RUN_MAX_MINUTES=330, после чего:
+#   1) состояние (SQLite: дедуп вакансий, подписчики, настройки) коммитится в ветку
+#      (cookie из БД вычищается — он живёт в секретах и не должен попадать в репо);
+#   2) ран запускает сам себя через workflow_dispatch (эстафета).
+# Триггеры:
+#   workflow_dispatch — ручной запуск/перезапуск (кнопка «Run workflow»);
+#   push в main       — обновили код → бот перезапустится с новой версией
+#                       (коммиты БД от GITHUB_TOKEN циклов не создают);
+#   schedule раз в 6ч — страховка, если эстафета оборвалась.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 */6 * * *'
+
+# Новый ран ждёт окончания старого и подхватывает эстафету (не отменяет его)
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # коммит data/hirify_bot.db
+  actions: write    # self-dispatch (workflow_dispatch — исключение из правил GITHUB_TOKEN)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # жёсткий предел GitHub — 6 ч; бот сам выходит на 330-й минуте, это лишь страховка
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Запуск бота (до 330 минут)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+          RUN_MAX_MINUTES: '330'
+          DROP_PENDING_UPDATES: '0'
+          LOG_LEVEL: INFO
+        run: python main.py
+
+      - name: Сохранить состояние (SQLite) в репозиторий
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "hirify-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -f data/hirify_bot.db ]; then
+            # cookie не должен попадать в публичный репозиторий: в ране он
+            # приходит из секрета HIRIFY_COOKIE, из БД его вычищаем
+            sqlite3 data/hirify_bot.db "DELETE FROM settings WHERE key='hirify_cookie';"
+            git add -f data/hirify_bot.db
+          fi
+          if git diff --cached --quiet; then
+            echo "Состояние не изменилось"
+          else
+            git commit -m "chore(bot): состояние БД [skip ci]"
+            git pull --rebase --autostash || true
+            git push || echo "⚠️ Не удалось запушить БД (продолжаем)"
+          fi
+
+      - name: "Эстафета: перезапустить бота"
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh workflow run bot.yml --ref "${GITHUB_REF_NAME}"; then
+            echo "✅ Новый ран запущен — эстафета продолжается"
+          elif [ -n "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "Фолбэк: перезапуск через PAT_TOKEN"
+            GH_TOKEN="${{ secrets.PAT_TOKEN }}" gh workflow run bot.yml --ref "${GITHUB_REF_NAME}"
+          else
+            echo "⚠️ Перезапуск не удался — подхватит страховочный cron (раз в 6 ч)"
+            exit 1
+          fi

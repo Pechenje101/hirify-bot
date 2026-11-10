@@ -1,0 +1,323 @@
+"""Ядро: цикл мониторинга фида hirify.me и рассылка новых вакансий с прямыми TG-контактами."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from .db import Database
+from .hirify import HirifyClient, HirifyError, HirifyNotFound
+from .parsing import extract_job_links, parse_job_page
+from .sender import VacancySender
+
+log = logging.getLogger("hirify.monitor")
+
+COOKIE_WARN_COOLDOWN_SEC = 6 * 3600  # не чаще раза в 6 часов
+NUDGE_COOLDOWN_SEC = 60              # /start не должен дёргать фид чаще раза в минуту
+MAX_FETCH_ATTEMPTS = 3               # столько раз пробуем загрузить страницу вакансии
+MAX_SEND_ATTEMPTS = 10               # потолок ретраев доставки (send_failed → failed)
+
+
+class Monitor:
+    def __init__(self, client: HirifyClient, db: Database, sender: VacancySender, config):
+        self.cfg = config
+        self.client = client
+        self.db = db
+        self.sender = sender
+        self._last_cookie_warn = 0.0
+        self._last_poll_ts = 0.0
+        self._running = False
+        self._busy = False
+        self._wake = asyncio.Event()
+        self._bg_tasks: set[asyncio.Task] = set()  # сильные ссылки на fire-and-forget задачи
+
+    @property
+    def busy(self) -> bool:
+        """Идёт ли прямо сейчас проход poll_once (чтобы не запускать параллельно)."""
+        return self._busy
+
+    @property
+    def last_poll_ts(self) -> float:
+        """Когда закончился последний проход (для кулдауна /fresh)."""
+        return self._last_poll_ts
+
+    # ---------------------------------------------------------------- API
+
+    @property
+    def paused(self) -> bool:
+        return self.db.get_setting("paused", "0") == "1"
+
+    def pause(self) -> None:
+        self.db.set_setting("paused", "1")
+
+    def resume(self) -> None:
+        self.db.set_setting("paused", "0")
+        self.nudge()  # проснулись — проверяем фид сразу, без ожидания интервала
+
+    def nudge(self) -> None:
+        """Попросить цикл проверить фид при первой возможности (не чаще раза в минуту)."""
+        if self._busy:
+            return  # проход и так идёт — всё найдёт
+        if time.time() - self._last_poll_ts < NUDGE_COOLDOWN_SEC:
+            return
+        self._wake.set()
+
+    def next_interval(self, stats: dict) -> float:
+        """Сколько ждать до следующего прохода.
+
+        Ключ к «карточка приходит сразу, как только найдена": если в прошлом
+        проходе было новое (отправили или отфильтровали) — пересматриваем фид
+        уже через FAST_POLL_SEC секунд, а не через полный интервал.
+        """
+        if stats.get("total", 0) >= self.cfg.max_per_poll:
+            return self.cfg.fast_poll_sec  # пачка не влезла в лимит — догоняем быстро
+        if stats.get("sent", 0) > 0 or stats.get("total", 0) > 0:
+            return self.cfg.fast_poll_sec  # было движение — вдруг появилось ещё
+        return self.cfg.poll_minutes * 60
+
+    async def _sleep(self, seconds: float) -> None:
+        """Сон, который можно прервать: /resume, /start (nudge) или stop()."""
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=max(1.0, seconds))
+        except asyncio.TimeoutError:
+            pass
+        self._wake.clear()  # гасим событие после ожидания, чтобы не потерять nudge
+
+    async def run_forever(self) -> None:
+        """Фоновая задача: адаптивный цикл. Запускается из main().
+
+        Обычный ритм — раз в POLL_MINUTES минут; сразу после находки —
+        повторная проверка через FAST_POLL_SEC секунд, чтобы новые карточки
+        уходили практически в момент появления на сайте.
+        """
+        self._running = True
+        log.info(
+            "Мониторинг запущен: базовый интервал %.0f мин., повтор после находки — через %.0f c",
+            self.cfg.poll_minutes, self.cfg.fast_poll_sec,
+        )
+        while self._running:
+            wait = self.cfg.poll_minutes * 60
+            if not self.paused:
+                try:
+                    stats = await self.poll_once(source="auto")
+                    wait = self.next_interval(stats)
+                except Exception:  # noqa: BLE001
+                    log.exception("Цикл мониторинга упал с ошибкой")
+            await self._sleep(wait)
+        log.info("Мониторинг остановлен")
+
+    def stop(self) -> None:
+        self._running = False
+        self._wake.set()  # разбудить сон, чтобы цикл завершился сразу
+
+    @staticmethod
+    def _new_stats() -> dict:
+        return {
+            "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
+            "fetch_failed": 0, "send_failed": 0, "no_audience": 0, "cookie_warn": False,
+        }
+
+    @staticmethod
+    def _recipients_for(v, subscribers: list[dict]) -> list[dict]:
+        """Подписчики, которым интересен раздел этой вакансии.
+
+        feeds=None — «по умолчанию» (все разделы бота); пустое множество —
+        человек выключил всё; иначе — выбранные в /settings разделы.
+        """
+        out: list[dict] = []
+        for s in subscribers:
+            feeds = s.get("feeds")
+            if feeds is not None and (v.feed_key or "") not in feeds:
+                continue
+            out.append(s)
+        return out
+
+    async def poll_once(self, source: str = "manual", limit: int | None = None) -> dict:
+        """Один проход: фид → новые → парсинг → отправка подписчикам.
+
+        Возвращает счётчики {total, sent, skipped, filtered, failed,
+        fetch_failed, send_failed, no_audience, cookie_warn}.
+        """
+        max_jobs = limit if limit is not None else self.cfg.max_per_poll
+        if self._busy:
+            log.warning("poll_once уже выполняется — пропускаю повторный запуск")
+            return self._new_stats()
+        self._busy = True
+        try:
+            return await self._poll_impl(source, max_jobs)
+        finally:
+            self._busy = False
+            self._last_poll_ts = time.time()
+
+    async def _poll_impl(self, source: str, max_jobs: int) -> dict:
+        stats = self._new_stats()
+
+        # 1) собираем ссылки вакансий из всех активных разделов (лендинги уже
+        #    отфильтрованы на сервере: удалёнка / глобальная / crypto и т.д.)
+        links: list[tuple[int, str, str, object]] = []  # (job_id, slug, url, feed)
+        for feed in self.cfg.feeds:
+            got_any = False
+            for page in range(1, max(1, self.cfg.feed_pages) + 1):
+                try:
+                    html = await self.client.fetch_feed(feed, page)
+                except HirifyError as e:
+                    log.error("Не удалось загрузить фид «%s» (страница %d): %s", feed.key, page, e)
+                    break
+                page_links = extract_job_links(html, base_url=self.cfg.hirify_base)
+                links.extend((jid, slug, url, feed) for jid, slug, url in page_links)
+                got_any = got_any or bool(page_links)
+                if len(page_links) < 10:  # на странице мало вакансий — дальше не идём
+                    break
+            if got_any:
+                log.debug("фид «%s»: собрано", feed.key)
+
+        # 2) оставляем только те, что ещё не видели (дедуп по всем разделам сразу;
+        #    send_failed/fetch_failed known_job_ids не вернёт — будет ретрай)
+        seen_in_run: set[int] = set()
+        unique: list[tuple[int, str, str, object]] = []
+        for row in links:
+            if row[0] in seen_in_run:
+                continue
+            seen_in_run.add(row[0])
+            unique.append(row)
+        known = self.db.known_job_ids([job_id for job_id, _, _, _ in unique])
+        fresh = [row for row in unique if row[0] not in known]
+        if not fresh:
+            log.debug("Новых вакансий нет")
+            return stats
+
+        # без подписчиков открывать страницы смысла нет — экономим запросы
+        subscribers = self.db.subscriber_settings()
+        if not subscribers:
+            log.debug("Подписчиков нет — новые вакансии пропускаю (вернутся как ретрай)")
+            return stats
+
+        # 3) открываем каждую страницу вакансии, ищем контакты
+        fresh = fresh[:max_jobs]
+        log.info("[%s] новых вакансий: %d (лимит %d, разделы: %s)", source, len(fresh), max_jobs,
+                 ", ".join(f.key for f in self.cfg.feeds))
+
+        for job_id, slug, url, feed in fresh:
+            self.db.add_job(job_id, slug, url)
+            stats["total"] += 1
+            try:
+                html = await self.client.fetch_job(url)
+                v = parse_job_page(html, url)
+            except HirifyNotFound as e:
+                log.warning("Вакансия недоступна (удалена?): %s", e)
+                self.db.mark_job(job_id, "failed")
+                stats["failed"] += 1
+                continue
+            except HirifyError as e:
+                # сеть/таймаут/5xx — попробуем в следующем проходе (до MAX_FETCH_ATTEMPTS)
+                attempts = self.db.bump_job_attempts(job_id)
+                if attempts >= MAX_FETCH_ATTEMPTS:
+                    self.db.mark_job(job_id, "failed")
+                    stats["failed"] += 1
+                else:
+                    self.db.mark_job(job_id, "fetch_failed")
+                    stats["fetch_failed"] += 1
+                log.warning("Не удалось загрузить %s (попытка %d/%d): %s",
+                            url, attempts, MAX_FETCH_ATTEMPTS, e)
+                continue
+            except Exception as e:  # noqa: BLE001 — битая вёрстка/JSON — навсегда
+                log.warning("Не удалось распарсить %s: %s", url, e)
+                self.db.mark_job(job_id, "failed")
+                stats["failed"] += 1
+                continue
+
+            v.feed_key, v.feed_label = feed.key, feed.label
+            self.db.update_job_parsed(
+                job_id, title=v.title, company=v.company, salary=v.salary,
+                tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
+            )
+
+            # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
+            if not v.has_direct_contact:
+                self.db.mark_job(job_id, "skipped_no_contact")
+                stats["skipped"] += 1
+                log.debug("job %d: TG-контакта нет — пропускаю", job_id)
+                if v.contacts_hidden:
+                    stats["cookie_warn"] = True
+                    self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
+                continue
+
+            # ФИЛЬТР 2: строгая проверка раздела (страховка поверх серверных лендингов)
+            if feed.key in ("remote", "global", "crypto_remote") and self.cfg.remote_strict and v.is_non_remote:
+                self.db.mark_job(job_id, "skipped_not_remote")
+                stats["filtered"] += 1
+                log.debug("job %d: формат «%s» — не удалёнка, пропускаю", job_id, v.work_format)
+                continue
+            if feed.key == "crypto" and self.cfg.crypto_strict and not v.is_crypto:
+                self.db.mark_job(job_id, "skipped_not_crypto")
+                stats["filtered"] += 1
+                log.debug("job %d: крипто-признаков нет — пропускаю", job_id)
+                continue
+
+            # рассылка: только тем, кто выбрал этот раздел в /settings
+            recipients = self._recipients_for(v, subscribers)
+            if not recipients:
+                # вакансия валидна, но ни одному подписчику не интересна —
+                # финализируем (иначе гоняла бы ретраями до бесконечности)
+                self.db.mark_job(job_id, "sent")
+                stats["no_audience"] += 1
+                log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
+                          job_id, v.feed_key)
+                continue
+            # считаем доставки — если НЕ УДАЛОСЬ НИ ОДНОЙ, вакансия
+            # не финализируется (send_failed) и уйдёт ретраем в следующем проходе
+            delivered = 0
+            for s in recipients:
+                try:
+                    await self.sender.send_vacancy(
+                        s["chat_id"], v,
+                        silent=s["silent"],
+                        display=s.get("display", "auto"),
+                    )
+                    delivered += 1
+                except Exception as e:  # noqa: BLE001
+                    log.error("Не отправилось сообщение в чат %s: %s", s["chat_id"], e)
+            if delivered:
+                self.db.mark_job(job_id, "sent")
+                stats["sent"] += 1
+            else:
+                attempts = self.db.bump_job_attempts(job_id)
+                if attempts >= MAX_SEND_ATTEMPTS:
+                    self.db.mark_job(job_id, "failed")
+                    stats["failed"] += 1
+                    log.warning(
+                        "job %d: доставка не удалась %d раз — снимаю с ретрая (failed)",
+                        job_id, attempts,
+                    )
+                else:
+                    self.db.mark_job(job_id, "send_failed")
+                    stats["send_failed"] += 1
+                    log.warning("job %d: ни одна отправка не прошла — повторю в следующем проходе", job_id)
+
+        return stats
+
+    # ---------------------------------------------------------------- helpers
+
+    def _warn_cookie(self, recipients: list[int]) -> None:
+        """Одно напоминание в 6 часов, если контакты выглядят скрытыми."""
+        now = time.time()
+        if now - self._last_cookie_warn < COOKIE_WARN_COOLDOWN_SEC:
+            return
+        self._last_cookie_warn = now
+        from . import texts
+
+        async def _task() -> None:
+            for chat_id in recipients[:1]:
+                try:
+                    await self.sender.send_text(chat_id, texts.COOKIE_HINT)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_task())
+            # держим сильную ссылку: fire-and-forget задачи может собрать GC
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except RuntimeError:
+            pass
