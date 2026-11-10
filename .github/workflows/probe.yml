@@ -20,3 +20,5 @@ jobs:
         run: pip install -r requirements.txt
       - name: Живая диагностика без cookie
         run: python tools/probe_live.py
+      - name: Диагностика API и JS
+        run: python tools/probe_api.py
