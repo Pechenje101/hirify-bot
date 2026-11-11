@@ -155,7 +155,10 @@ class Config:
     # 1 = разрешить HTML-виджеты (Bot API 10.4+, Telegram 13.2+) для подписчиков,
     # выбравших «Пузырь» в /settings; при сбое — откат на rich/классику
     use_widget: bool = field(default_factory=lambda: _get_bool("USE_WIDGET", True))
-    description_limit: int = field(default_factory=lambda: _get_int("DESCRIPTION_LIMIT", 1800))
+    # Лимиты описаний карточек НЕ настраиваются — автобюджет под лимиты Telegram:
+    # rich — до 32768 символов html (полное описание в <details>), классика —
+    # 4096 видимых символов (<blockquote expandable>), виджет — 32 КБ html /
+    # 4096 байт zlib-9. См. app/cards.py и app/bubble.py.
     # Пауза между отправками сообщений (flood-контроль), сек
     send_delay_sec: float = field(default_factory=lambda: _get_float("SEND_DELAY_SEC", 1.2))
 

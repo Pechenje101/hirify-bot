@@ -39,8 +39,9 @@ def test_bubble_structure():
     assert "👤 Рекрутер" in html and "@demo_recruiter" in html
     assert "Ещё в Telegram: @chaindemo_hr" in html
     assert 'href="https://t.me/chaindemo_hr"' not in html
-    # футер со свежестью
-    assert "hirify.me · опубликовано " in html
+    # футер со свежестью — только свежесть, без упоминания источника
+    assert "опубликовано " in html
+    assert "hirify" not in html.lower()
 
 
 def test_bubble_buttons_inside_widget():
@@ -93,12 +94,15 @@ def test_bubble_fits_widget_limits():
 
 
 def test_bubble_trims_description_but_keeps_structure():
-    """Очень длинное описание ужимается, но карточка остаётся целой."""
+    """Очень длинное описание ужимается, но карточка остаётся целой:
+    тизер с многоточием, никаких заглушек про «полное описание на сайте»."""
     v = _vac_with_huge_description(50_000)
     html = render_bubble_html(v)
-    assert "полное описание — на hirify.me" in html
+    assert "hirify" not in html.lower()
+    assert "полное описание — на" not in html.lower()
+    assert " …" in html            # длинный текст — просто многоточие
     assert "<h3>Big Description Role</h3>" in html
-    assert '<div class="ft">hirify.me</div>' in html  # футер на месте (даты нет — без свежести)
+    assert '<div class="ft">' not in html  # даты нет — футера нет вовсе
     raw, comp = assert_widget_fits(html)
     assert comp <= MAX_COMPRESSED_BYTES
 
@@ -124,7 +128,7 @@ def test_bubble_caption():
     # без полей — осмысленный минимум; длинное — обрезается
     from app.parsing import Vacancy
 
-    assert render_bubble_caption(Vacancy(job_id=2, slug="s", url="u")) == "Вакансия на hirify.me"
+    assert render_bubble_caption(Vacancy(job_id=2, slug="s", url="u")) == "Вакансия"
     long_v = Vacancy(job_id=3, slug="s", url="u", title="Т" * 500)
     assert len(render_bubble_caption(long_v)) <= 200
     assert render_bubble_caption(long_v).endswith("…")
@@ -145,7 +149,8 @@ def test_bubble_minimal_vacancy():
     assert '<div class="fx">' not in html
     assert '<div class="pn">' not in html
     assert '<div class="bs">' not in html
-    assert "hirify.me</div>" in html
+    assert '<div class="ft">' not in html  # без даты — без футера, пустых блоков нет
+    assert "hirify" not in html.lower()
     assert_widget_fits(html)
 
 

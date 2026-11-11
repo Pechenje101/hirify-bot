@@ -10,7 +10,8 @@
 - ≤16 «тяжёлых» элементов с blur-тенью — у нас их 3 (панель фактов,
   панель рекрутера, чип зарплаты), так что запас большой;
 - высота виджета авто (50–600 px) и НЕ скроллится — поэтому описание даём
-  тизером (2–4 строки), а полный текст живёт в rich/классике и на сайте;
+  тизером (2–4 строки), полный текст живёт в rich/классике, разворачиваясь
+  прямо в их карточках (<details>/<blockquote expandable>);
 - действия — нативные <button>: openTelegramLink('https://t.me/…') открывает
   чат с рекрутером без подтверждений, copyText копирует @юзернейм с тостом;
   для контакта вида tg://user?id= кнопок внутри нет (виджет умеет только
@@ -153,8 +154,9 @@ def render_bubble_html(v: Vacancy, limit: int = BUBBLE_DESCRIPTION_LIMIT) -> str
 
     Слои: подзаголовок (компания · раздел) → заголовок → чип зарплаты →
     панель фактов → описание-тизер → панель рекрутера → кнопки-действия →
-    футер «hirify.me · опубликовано …». Гарантированно влезает в лимиты
-    Bot API (32 КБ / 4096 байт zlib-9): при переполнении ужимаем описание.
+    футер «опубликовано …» (без даты — без футера). Гарантированно влезает
+    в лимиты Bot API (32 КБ / 4096 байт zlib-9): при переполнении ужимаем
+    описание.
     """
     parts: list[str] = [_BUBBLE_CSS, '<div class="jc">']
 
@@ -177,12 +179,15 @@ def render_bubble_html(v: Vacancy, limit: int = BUBBLE_DESCRIPTION_LIMIT) -> str
     if desc and limit > 0:
         teaser = _teaser(desc, maxlen=limit)
         if teaser:
-            note = "" if len(desc) <= len(teaser) + 20 else " …(полное описание — на hirify.me)"
+            # упоминаний источника нет; если текст длиннее тизера — просто многоточие
+            note = "" if len(desc) <= len(teaser) + 20 else " …"
             parts.append(f'<div class="ds">{_esc(teaser)}{note}</div>')
 
     parts.append(_recruiter_panel(v))
     parts.append(_buttons_html(v))
-    parts.append(f'<div class="ft">{_esc(_footer_line(v))}</div>')
+    footer = _footer_line(v)
+    if footer:
+        parts.append(f'<div class="ft">{_esc(footer)}</div>')
     parts.append("</div>")
 
     html = "".join(parts)
@@ -205,10 +210,11 @@ def render_bubble_html(v: Vacancy, limit: int = BUBBLE_DESCRIPTION_LIMIT) -> str
 def render_bubble_caption(v: Vacancy) -> str:
     """Caption виджета (0–1024 символов, обычный текст): заголовок, компания,
     зарплата. Видно в списке чатов, в уведомлениях и в клиентах без
-    поддержки виджетов — поэтому всегда что-то осмысленное."""
+    поддержки виджетов — поэтому всегда что-то осмысленное (и без упоминаний
+    источника вакансий — карточка самодостаточна)."""
     bits = [b.strip() for b in (v.title, v.company, v.salary) if b and b.strip()]
     if not bits:
-        bits = ["Вакансия на hirify.me"]
+        bits = ["Вакансия"]
     out = " · ".join(bits)
     if len(out) > 200:
         out = out[:197].rstrip() + "…"

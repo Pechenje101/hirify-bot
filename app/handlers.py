@@ -262,7 +262,19 @@ async def on_settings_callback(cb: CallbackQuery, services: Services):
     except Exception:  # noqa: BLE001 — старое сообщение могли удалить
         pass
     if action == "display":
-        await cb.answer(f"Вид карточек: {texts.DISPLAY_LABELS_RU.get(display, display)}")
+        # сразу показываем карточку в новом виде: видно, чем именно теперь
+        # приходят вакансии (пузырь/rich/классика), без ожидания новой вакансии
+        label = texts.DISPLAY_LABELS_RU.get(display, display)
+        sent = False
+        try:
+            await services.sender.send_vacancy(
+                chat_id, demo_vacancy(), display=display, silent=True,
+            )
+            sent = True
+        except Exception:  # noqa: BLE001 — демо не критично, настройка уже сохранена
+            pass
+        note = " — отправил демо-карточку" if sent else ""
+        await cb.answer(f"Вид карточек: {label}{note}")
     else:
         await cb.answer("✅ Сохранено")
 

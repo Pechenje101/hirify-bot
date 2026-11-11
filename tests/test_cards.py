@@ -39,7 +39,8 @@ def test_rich_html_structure():
     # дата публикации — не в таблице, а в футере со свежестью
     assert "Опубликовано" not in html
     assert "<hr/>" in html  # разделитель фактов и описания
-    assert "<footer>hirify.me · " in html and html.rstrip().endswith("</footer>")
+    assert "<footer>опубликовано сегодня</footer>" in html
+    assert html.rstrip().endswith("</footer>")
     # описание сворачивается
     assert "<details><summary>" in html
     # контакт-панель (blockquote = подложка с акцентом в клиентах) и кнопки-действия
@@ -98,25 +99,27 @@ def test_freshness_relative_dates():
 
 
 def test_footer_line_without_date():
+    """Футер — только свежесть; без даты — пустой, без упоминаний источника."""
     from app.cards import _footer_line
     from app.parsing import Vacancy
 
     v = Vacancy(job_id=1, slug="s", url="u", title="x")
-    assert _footer_line(v) == "hirify.me"
+    assert _footer_line(v) == ""
     v2 = demo_vacancy()
-    assert _footer_line(v2).startswith("hirify.me · опубликовано ")
+    assert _footer_line(v2).startswith("опубликовано ")
 
 
 def test_rich_footer_and_hr_in_full_card():
     html = render_rich_html(DEMO)
-    # ритм: таблица → hr → описание; кнопки → футер
+    # ритм: таблица → hr → описание; кнопки → футер (только свежесть, без источника)
     assert "</table>\n<hr/>" in html
     footer = html.rstrip().rsplit("\n", 1)[-1]
-    assert footer.startswith("<footer>hirify.me · опубликовано ") and footer.endswith("</footer>")
+    assert footer.startswith("<footer>опубликовано ") and footer.endswith("</footer>")
 
 
-def test_minimal_card_has_footer_but_no_hr():
-    """Без фактов hr не нужен, но футер со свежестью появляется всегда."""
+def test_minimal_card_without_date_has_no_footer_and_no_hr():
+    """Без фактов hr не нужен; без даты публикации — нет и футера (не пустого).
+    Упоминаний источника вакансий в карточке не остаётся вовсе."""
     from app.parsing import TGContact, Vacancy
 
     v = Vacancy(
@@ -125,7 +128,7 @@ def test_minimal_card_has_footer_but_no_hr():
     )
     html = render_rich_html(v)
     assert "<hr/>" not in html
-    assert "<footer>hirify.me</footer>" in html
+    assert "<footer>" not in html
 
 
 def test_clean_label_strips_leading_emoji():
@@ -161,6 +164,7 @@ def test_rich_html_escapes_dangerous_text():
 
 
 def test_rich_html_truncates_description():
+    """Явный limit — жёсткий потолок: обрезка без заглушек, просто многоточие."""
     from app.parsing import TGContact, Vacancy
 
     v = Vacancy(
@@ -170,15 +174,31 @@ def test_rich_html_truncates_description():
     )
     html = render_rich_html(v, limit=800)
     assert len(html) < 1800
-    assert "полный текст — на hirify.me" in html
+    assert "…" in html
+    assert "hirify" not in html.lower()
 
 
 def test_rich_and_classic_fit_telegram_limit():
-    """Весь rich-блок с дефолтным лимитом обязан влезать в 4096 символов Telegram."""
-    html = render_rich_html(DEMO, limit=1800)
-    assert len(html) <= 4096, f"rich-карточка слишком длинная: {len(html)}"
-    classic = render_classic_html(DEMO, limit=1800)
-    assert len(classic) <= 4096, f"классическая карточка слишком длинная: {len(classic)}"
+    """Автобюджет: rich — целиком в 32768 символов html, классика — в 4096
+    видимых символов (после разбора entities)."""
+    from app.cards import _visible_len
+
+    html = render_rich_html(DEMO)
+    assert len(html) <= 32768, f"rich-карточка слишком длинная: {len(html)}"
+    classic = render_classic_html(DEMO)
+    assert _visible_len(classic) <= 4096, f"классическая карточка длиннее лимита: {_visible_len(classic)}"
+
+    # и то же для гипотетически огромного описания — автобюджет ужимает
+    from app.parsing import TGContact, Vacancy
+
+    v = Vacancy(
+        job_id=12, slug="huge", url="https://hirify.me/jobs/12-huge",
+        title="Huge",
+        description="абзац описания\n\n" * 4000,  # ~80 000 символов
+        contacts=[TGContact("username", "huge_hr", "@huge_hr", "https://t.me/huge_hr", "contacts")],
+    )
+    assert len(render_rich_html(v)) <= 32768
+    assert _visible_len(render_classic_html(v)) <= 4096
 
 
 def test_classic_html():
@@ -199,8 +219,8 @@ def test_classic_html():
     assert "Ещё: <a href=\"https://t.me/chaindemo_hr\">@chaindemo_hr</a>" in html
     # дата в футере со свежестью
     assert "11.11.2026" in html or "опубликовано" in html
-    # сдержанный футер и никаких rich-тегов
-    assert html.endswith("</i>") and "<i>hirify.me" in html
+    # сдержанный футер (только свежесть) и никаких rich-тегов
+    assert html.endswith("</i>") and "<i>опубликовано" in html
     for tag in ("<tg-button", "<details", "<table", "<h3", "<tg-button-row"):
         assert tag not in html, f"rich-тег {tag} попал в классическую карточку"
     assert "<blockquote expandable>" in html  # длинное описание сворачивается
@@ -220,6 +240,35 @@ def test_classic_long_description_uses_expandable_quote():
     )
     html = render_classic_html(v, limit=2400)
     assert "<blockquote expandable>" in html
+
+
+def test_full_description_lives_inside_cards():
+    """Полное описание — прямо в карточке (разворачивается), а не заглушка
+    «полный текст — на сайте»: хвост описания присутствует и в rich, и в
+    классике; упоминаний источника вакансий нет нигде."""
+    from app.parsing import TGContact, Vacancy
+
+    tail = "ФИНАЛЬНЫЙ АБЗАЦ: условия, релокация, бонусы и контакты в конце текста."
+    v = Vacancy(
+        job_id=13, slug="full", url="https://hirify.me/jobs/13-full",
+        title="Full Description Role",
+        company="Full Corp",
+        description="\n\n".join(f"Раздел {i}. Обязанности, стек и процессы команды." for i in range(40))
+                    + "\n\n" + tail,
+        contacts=[TGContact("username", "full_hr", "@full_hr", "https://t.me/full_hr", "contacts")],
+    )
+    rich = render_rich_html(v)
+    classic = render_classic_html(v)
+    assert tail in rich            # rich вмещает всё целиком
+    assert tail in classic         # ~1 800 символов — тоже влезает в 4096
+    assert "Показать полное описание" in rich
+    assert "<blockquote expandable>" in classic
+    assert "hirify" not in rich.lower()
+    assert "hirify" not in classic.lower()
+    # никаких заглушек про «полное описание на сайте»
+    for stub in ("полное описание — на", "полный текст — на", "описание на сайте"):
+        assert stub not in rich.lower()
+        assert stub not in classic.lower()
 
 
 def test_inline_keyboard():

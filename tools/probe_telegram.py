@@ -111,7 +111,7 @@ async def main() -> None:
     # 4) sendRichMessage (Bot API 10.1) с rich-html карточки
     await raw_call(token, "sendRichMessage",
                    {"chat_id": PROBE_CHAT_ID,
-                    "rich_message": render_rich_html(DEMO, limit=32768)})
+                    "rich_message": render_rich_html(DEMO)})
     # 5) тот же sendWidget через aiogram — путь приложения целиком
     await aiogram_call(token)
 

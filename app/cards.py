@@ -9,11 +9,17 @@ Telegram недоступны, поэтому «объём» даём панел
 рисуют blockquote с фоном и акцентной полосой, а details — сворачиваемым.
 
 Ритм rich-карточки: заголовок → компания · раздел → зарплата → таблица
-фактов → разделитель <hr/> → описание (тизер + сворачиваемый блок) →
-панель рекрутера → сворачиваемые доп. контакты → кнопки-действия →
-мелкий футер <footer> («hirify.me · опубликовано сегодня/вчера/N дней назад»).
+фактов → разделитель <hr/> → описание (тизер + сворачиваемый блок с ПОЛНЫМ
+текстом) → панель рекрутера → сворачиваемые доп. контакты → кнопки-действия →
+мелкий футер <footer> («опубликовано сегодня/вчера/N дней назад» — без упоминания
+источника: карточка самодостаточна, весь текст вакансии внутри).
 Тонкая линия <hr/> и приглушённый <footer> — поддерживаются Rich HTML
 (Bot API 10.1–10.3) и дают «дыхание» композиции без CSS.
+
+Полное описание, а не заглушка: rich-сообщения позволяют до 32768 символов
+html (Bot API 10.1+), поэтому описание уходит целиком в <details>; классика
+ограничена 4096 символами видимого текста — там тоже всё описание, в
+сворачиваемой цитате <blockquote expandable>, автобюджет подгоняет длину.
 
 Кнопки: «Написать рекрутеру» — style=success (rich) / style=primary
 (классика, Bot API 9.4+) — акцентная, «Копировать контакт» — нейтральная.
@@ -22,7 +28,7 @@ Telegram недоступны, поэтому «объём» даём панел
 
 Два формата из одних данных:
 1. Rich Message (Bot API 10.1+, поле html): h3-заголовок, компактная таблица
-   фактов, тизер + сворачиваемое описание, панель контакта, tg-кнопки, футер.
+   фактов, тизер + сворачиваемое ПОЛНОЕ описание, панель контакта, tg-кнопки, футер.
 2. Классический parse_mode=HTML + InlineKeyboardMarkup — работает у всех;
    факты и контакт тоже панелями-цитатами (blockquote поддерживается).
 """
@@ -35,6 +41,24 @@ from datetime import date, datetime
 from .parsing import TGContact, Vacancy
 
 E = html_mod.escape
+
+# Лимиты Telegram на текст карточек:
+#  - sendMessage (классика): 1–4096 символов ПОСЛЕ разбора entities —
+#    считаем «видимую» длину (теги выкидываем, entities разэкранируем);
+#  - sendRichMessage (Bot API 10.1+): html до 32768 символов — сюда описание
+#    помещается целиком, разворачивается <details> прямо в карточке.
+CLASSIC_TEXT_LIMIT = 4096
+RICH_HTML_LIMIT = 32768
+# Запас на шапку/факты/кнопки в rich-сообщении: описание больше этого —
+# встречается реже одного раза на сотню вакансий, тогда подгоняем авто-циклом.
+RICH_DESCRIPTION_LIMIT = 30_000
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _visible_len(html_text: str) -> int:
+    """Длина текста без тегов — так её считает Telegram для sendMessage."""
+    return len(html_mod.unescape(_TAG_RE.sub("", html_text or "")))
 
 # Ведущие эмодзи из меток разделов («🏠 Удалёнка») убираем — в карточке
 # стилистика Apple требует сдержанности; в /status метки остаются как есть.
@@ -138,9 +162,15 @@ def _contact_action(primary: TGContact) -> str:
 
 
 def _description_paragraphs(text: str, limit: int) -> str:
-    """Обрезаем описание до limit и возвращаем готовый текст (БЕЗ экранирования здесь)."""
+    """Описание до limit символов. БЕЗ экранирования и БЕЗ заглушек про «полный
+    текст на сайте»: обрезка (сходится крайне редко — почти все вакансии
+    укладываются) заканчивается многоточием, разворачиваемый блок выше держит
+    всё, что влезло в лимит сообщения.
+    """
     text = (text or "").strip()
     if not text:
+        return ""
+    if limit <= 0:
         return ""
     if len(text) > limit:
         cut = text[:limit]
@@ -148,7 +178,7 @@ def _description_paragraphs(text: str, limit: int) -> str:
         nl = cut.rfind("\n")
         if nl > limit // 2:
             cut = cut[:nl]
-        text = cut.rstrip() + "\n…(полный текст — на hirify.me)"
+        text = cut.rstrip() + " …"
     return text
 
 
@@ -187,9 +217,10 @@ def _facts_rows(v: Vacancy, include_employment: bool = True) -> list[tuple[str, 
 
 
 def _footer_line(v: Vacancy) -> str:
-    """Мелкая строка-подвал «hirify.me · опубликовано …» (без даты, если её нет)."""
-    fresh = _fmt_freshness(v.date_posted)
-    return "hirify.me · " + fresh if fresh else "hirify.me"
+    """Мелкая строка-подвал с относительной свежестью; без даты — пустая
+    (и тогда футер не рисуем вовсе). Никаких упоминаний источника — карточка
+    самодостаточна: полное описание живёт прямо в ней."""
+    return _fmt_freshness(v.date_posted)
 
 
 def _extra_contacts(v: Vacancy, cap: int = 5) -> list[TGContact]:
@@ -232,14 +263,31 @@ def _recruiter_panel_rich(primary: TGContact) -> str:
 
 # ---------------------------------------------------------------- rich html
 
-def render_rich_html(v: Vacancy, limit: int = 1800) -> str:
+def render_rich_html(v: Vacancy, limit: int | None = None) -> str:
     """HTML для InputRichMessage.html (Bot API 10.1+).
 
     Слои карточки (сверху вниз): заголовок → компания · раздел → зарплата →
-    таблица-панель фактов → <hr/> → описание (тизер + сворачиваемый блок) →
-    панель рекрутера → сворачиваемые доп. контакты → кнопки-действия →
-    <footer> с источником и свежестью.
+    таблица-панель фактов → <hr/> → описание (тизер + сворачиваемый блок
+    с ПОЛНЫМ текстом) → панель рекрутера → сворачиваемые доп. контакты →
+    кнопки-действия → <footer> со свежестью.
+
+    limit=None (по умолчанию) — автобюджет: описание целиком (до ~30 000
+    символов), при выходе за лимит Bot API 32768 символов html — ужимаем
+    описание и пересобираем. Явный limit — жёсткий потолок описания
+    (для тестов и превью).
     """
+    desc_limit = RICH_DESCRIPTION_LIMIT if limit is None else max(0, limit)
+    html = _rich_impl(v, desc_limit)
+    if limit is None:
+        # автоподгонка: описание — единственная переменная часть карточки,
+        # пропорциональное ужимание сходится за 1–2 пересборки
+        while len(html) > RICH_HTML_LIMIT and desc_limit > 500:
+            desc_limit = max(500, int(desc_limit * RICH_HTML_LIMIT / len(html) * 0.97))
+            html = _rich_impl(v, desc_limit)
+    return html
+
+
+def _rich_impl(v: Vacancy, desc_limit: int) -> str:
     parts: list[str] = []
 
     # --- заголовок и контекст ---
@@ -260,7 +308,7 @@ def render_rich_html(v: Vacancy, limit: int = 1800) -> str:
         parts.append("<hr/>")  # тонкий разделитель: факты закончились, дальше — о работе
 
     # --- описание: тизер + сворачиваемый полный текст ---
-    full = _description_paragraphs(v.description, limit)
+    full = _description_paragraphs(v.description, desc_limit)
     if full:
         teaser = _teaser(full)
         body = E(full).replace(chr(10), "<br/>")
@@ -301,21 +349,40 @@ def render_rich_html(v: Vacancy, limit: int = 1800) -> str:
         if len(btns) > 2:
             parts.append("<tg-button-row>" + "".join(btns[2:]) + "</tg-button-row>")
 
-    # --- подвал: источник + относительная свежесть, мелким приглушённым ---
-    parts.append(f"<footer>{E(_footer_line(v))}</footer>")
+    # --- подвал: относительная свежесть (без даты — без подвала) ---
+    footer = _footer_line(v)
+    if footer:
+        parts.append(f"<footer>{E(footer)}</footer>")
 
     return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- классика
 
-def render_classic_html(v: Vacancy, limit: int = 1600) -> str:
+def render_classic_html(v: Vacancy, limit: int | None = None) -> str:
     """HTML для sendMessage(parse_mode='HTML') — фолбэк для всех клиентов.
 
     Тоже «панельно»: факты и контакт — в blockquote (современные клиенты
-    рисуют цитату с фоном и акцентной полосой), длинное описание —
-    в сворачиваемой цитате (blockquote expandable).
+    рисуют цитату с фоном и акцентной полосой), описание — сворачиваемой
+    цитатой <blockquote expandable>, ПОЛНОЕ, сколько влезло в сообщение.
+
+    limit=None (по умолчанию) — автобюджет под лимит sendMessage: 4096
+    символов видимого текста (теги не считаются, экранированные entities —
+    считаются). Явный limit — жёсткий потолок описания (тесты/превью).
     """
+    desc_limit = CLASSIC_TEXT_LIMIT if limit is None else max(0, limit)
+    text = _classic_impl(v, desc_limit)
+    if limit is None:
+        # описание — единственная переменная часть: пропорционально ужимаем,
+        # пока карточка не впишется в 4096 видимых символов (1–2 пересборки)
+        while _visible_len(text) > CLASSIC_TEXT_LIMIT and desc_limit > 200:
+            visible = _visible_len(text)
+            desc_limit = max(200, int(desc_limit * (CLASSIC_TEXT_LIMIT / visible) * 0.97))
+            text = _classic_impl(v, desc_limit)
+    return text
+
+
+def _classic_impl(v: Vacancy, desc_limit: int) -> str:
     lines: list[str] = []
 
     # шапка
@@ -333,8 +400,8 @@ def render_classic_html(v: Vacancy, limit: int = 1600) -> str:
             "<blockquote>" + "\n".join(f"{lbl} — {val}" for lbl, val in rows) + "</blockquote>"
         )
 
-    # описание: тизер + expandable-цитата для полного текста
-    full = _description_paragraphs(v.description, limit)
+    # описание: тизер + expandable-цитата с ПОЛНЫМ текстом
+    full = _description_paragraphs(v.description, desc_limit)
     if full:
         teaser = _teaser(full)
         esc = E(full)
@@ -368,7 +435,9 @@ def render_classic_html(v: Vacancy, limit: int = 1600) -> str:
                 "<blockquote>👤 <b>Прямой контакт рекрутера</b> — кнопка ниже откроет чат в Telegram</blockquote>"
             )
 
-    lines.append(f"<i>{E(_footer_line(v))}</i>")
+    footer = _footer_line(v)
+    if footer:
+        lines.append(f"<i>{E(footer)}</i>")
     return "\n\n".join(lines)
 
 
@@ -403,7 +472,9 @@ def inline_keyboard(v: Vacancy):
 # ---------------------------------------------------------------- демо
 
 def demo_vacancy() -> Vacancy:
-    """Синтетическая вакансия для команды /test (без обращения к hirify.me)."""
+    """Синтетическая вакансия для /test и мгновенного превью при смене вида
+    в /settings. Описание намеренно длинное — сразу видно, как разворачивается
+    полный текст прямо в карточке; упоминаний источника вакансий нет вовсе."""
     v = Vacancy(
         job_id=999999,
         slug="demo-senior-solidity-engineer",
@@ -417,15 +488,18 @@ def demo_vacancy() -> Vacancy:
         location="из любой точки мира",
         skills=["solidity", "evm", "hardhat", "web3.js", "react", "postgres"],
         description=(
-            "Так будет выглядеть вакансия из раздела «Глобальная удалёнка» "
-            "с прямым Telegram-контактом рекрутера — карточка в стилистике Apple: "
-            "чистая типографика, таблица фактов, ничего лишнего.\n\n"
-            "Что делает бот:\n"
-            "1. Следит за разделами hirify.me: Удалёнка, Глобальная удалёнка и Crypto & Web3\n"
-            "2. Берёт только вакансии с фильтром only_direct_contact=1&contact_types=telegram\n"
-            "3. Присылает карточку сразу, как только находит подходящую вакансию\n\n"
-            "Стек: EVM-сети, смарт-контракты, DeFi-протоколы. Полностью remote — "
-            "работаем из любой точки мира, зарплата в USDT.\n\n"
+            "Это демо-карточка: так выглядит вакансия из раздела «Глобальная\n"
+            "удалёнка» с прямым Telegram-контактом рекрутера — чистая типографика,\n"
+            "панель фактов и сворачиваемое полное описание.\n\n"
+            "Что внутри карточки:\n"
+            "1. Заголовок, компания · раздел и зарплата — сразу видны сверху\n"
+            "2. Панель фактов: формат работы, локация, занятость, стек\n"
+            "3. Это описание — свёрнуто, разворачивается одним касанием:\n"
+            "   весь текст вакансии прямо в карточке, целиком\n"
+            "4. Панель рекрутера с кнопкой «Написать» — чат откроется сразу\n\n"
+            "Стек и обязанности: EVM-сети, смарт-контракты, DeFi-протоколы,\n"
+            "аудит и оптимизация газа. Полностью remote — работаем из любой точки\n"
+            "мира, зарплата в USDT, собеседование в один раунд.\n\n"
             "Это демо-карточка — данные не настоящие."
         ),
         date_posted="2026-11-11",

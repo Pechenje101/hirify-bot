@@ -74,6 +74,10 @@ class VacancySender:
                 if i == len(plan) - 1:
                     raise  # классика — последняя инстанция: ошибка уходит в монитор
         await asyncio.sleep(self.cfg.send_delay_sec)
+        # вид доставки в лог: сразу видно, уходят ли выбравшим «Пузырь» виджеты,
+        # или они молча откатываются к rich/классике (и почему — строками выше)
+        log.info("job %s → чат %s: доставлено видом %s (выбрано %s)",
+                 v.job_id, chat_id, sent_with, display)
         return sent_with
 
     # ------------------------------------------------------------ план
@@ -110,7 +114,9 @@ class VacancySender:
                     self._widget_fails, exc,
                 )
             else:
-                log.info("Виджет не прошёл (%s), откат на следующий вид", exc)
+                # виджет — главная «фишка»: каждое откатывание видно в логах WARNING,
+                # чтобы причина (размер html, клиент без поддержки, лимиты) не пряталась
+                log.warning("Виджет не прошёл (%s), откат на следующий вид", exc)
         else:
             log.debug("Классическая отправка не прошла: %s", exc)
 
@@ -144,7 +150,9 @@ class VacancySender:
     async def _send_rich(self, chat_id: int, v: Vacancy, silent: bool) -> None:
         from aiogram.types import InputRichMessage
 
-        html = render_rich_html(v, limit=self.cfg.description_limit)
+        # лимит Bot API 10.1+ — 32768 символов html: описание вкладываем целиком
+        # (автобюджет внутри рендера), тизер + сворачиваемый полный текст
+        html = render_rich_html(v)
         # ВАЖНО: без reply_markup — кнопки уже внутри rich-разметки (tg-button),
         # иначе у сообщения были бы дублирующиеся ряды кнопок.
         await self._with_retry(
@@ -158,7 +166,8 @@ class VacancySender:
     # ------------------------------------------------------------ классика
 
     async def _send_classic(self, chat_id: int, v: Vacancy, silent: bool) -> None:
-        text = render_classic_html(v, limit=self.cfg.description_limit)
+        # автобюджет под 4096 видимых символов: полное описание в expandable-цитате
+        text = render_classic_html(v)
         await self._with_retry(
             lambda: self.bot.send_message(
                 chat_id=chat_id,

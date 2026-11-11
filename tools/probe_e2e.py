@@ -55,7 +55,7 @@ async def main() -> int:
             else:
                 print("  контакт: НЕТ")
             if got:
-                card = render_rich_html(v, limit=cfg.description_limit)
+                card = render_rich_html(v)  # автобюджет: полное описание
                 print(f"  карточка rich: {len(card)} симв.; фрагмент: {card[:120]!r}")
                 ok += 1
             else:
