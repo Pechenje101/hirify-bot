@@ -1,6 +1,5 @@
 """Тесты рендера карточек в стилистике Apple (Rich HTML + классика + клавиатура)."""
 import sys
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -35,11 +34,11 @@ def test_rich_html_structure():
     # таблица фактов с текстовыми подписями
     assert "<table compact>" in html
     assert "Формат" in html and "Global Remote" in html
-    assert "Локация" in html and "Стек" in html
-    # дата публикации — не в таблице, а в футере со свежестью
+    assert "Локация" in html and "Навыки" in html
+    # дата публикации — не в таблице, а в футере
     assert "Опубликовано" not in html
     assert "<hr/>" in html  # разделитель фактов и описания
-    assert "<footer>опубликовано сегодня</footer>" in html
+    assert "<footer>опубликовано 11.11.2026</footer>" in html
     assert html.rstrip().endswith("</footer>")
     # описание сворачивается
     assert "<details><summary>" in html
@@ -80,26 +79,23 @@ def test_rich_html_badges_and_dates():
     assert _fmt_date("") == ""
 
 
-def test_freshness_relative_dates():
-    """Свежесть в футере: сегодня/вчера/N дня(ей) назад, старше недели — дата."""
-    today = date(2026, 11, 11)
-    assert _fmt_freshness("2026-11-11", today) == "опубликовано сегодня"
-    assert _fmt_freshness("2026-11-11T23:59:00+00:00", today) == "опубликовано сегодня"
-    assert _fmt_freshness("2026-11-10", today) == "опубликовано вчера"
-    assert _fmt_freshness("2026-11-08", today) == "опубликовано 3 дня назад"
-    assert _fmt_freshness("2026-11-07", today) == "опубликовано 4 дня назад"
-    assert _fmt_freshness("2026-11-05", today) == "опубликовано 6 дней назад"
-    assert _fmt_freshness("2026-11-01", today) == "опубликовано 01.11.2026"
-    assert _fmt_freshness("2026-10-01", today) == "опубликовано 01.10.2026"
-    assert _fmt_freshness("", today) == ""
-    assert _fmt_freshness("мусор", today) == ""
-    # будущее/битое — не падаем, считаем «сегодня»
-    assert _fmt_freshness("2026-11-12", today) == "опубликовано сегодня"
-    assert _fmt_freshness("2026-13-99", today) == ""
+def test_freshness_is_publication_date():
+    """Футер — точная дата публикации (DD.MM.YYYY), а не относительная
+    «сегодня/вчера/N дней назад»: фид медленный, относительная формулировка
+    ничего не сообщала."""
+    assert _fmt_freshness("2026-11-11") == "опубликовано 11.11.2026"
+    assert _fmt_freshness("2026-11-11T23:59:00+00:00") == "опубликовано 11.11.2026"
+    assert _fmt_freshness("2026-11-10") == "опубликовано 10.11.2026"
+    assert _fmt_freshness("2026-11-01") == "опубликовано 01.11.2026"
+    assert _fmt_freshness("2026-10-01") == "опубликовано 01.10.2026"
+    assert _fmt_freshness("2026-01-02") == "опубликовано 02.01.2026"
+    assert _fmt_freshness("") == ""
+    assert _fmt_freshness("мусор") == ""
+    assert _fmt_freshness("2026-13-99") == ""
 
 
 def test_footer_line_without_date():
-    """Футер — только свежесть; без даты — пустой, без упоминаний источника."""
+    """Футер — только дата публикации; без даты — пустой, без упоминаний источника."""
     from app.cards import _footer_line
     from app.parsing import Vacancy
 
@@ -212,14 +208,14 @@ def test_classic_html():
     # факты — панелью-цитатой (blockquote с подложкой в современных клиентах),
     # дата публикации — не в фактах, а в футере
     assert "<blockquote>Формат — Global Remote\nЛокация — из любой точки мира" in html
-    assert "Стек — solidity" in html
+    assert "Навыки — solidity" in html
     assert "Опубликовано" not in html
     # контакт — тоже панелью, с доп. контактами внутри
     assert "<blockquote>👤 Рекрутер — <b>@demo_recruiter</b>" in html
     assert "Ещё: <a href=\"https://t.me/chaindemo_hr\">@chaindemo_hr</a>" in html
-    # дата в футере со свежестью
-    assert "11.11.2026" in html or "опубликовано" in html
-    # сдержанный футер (только свежесть) и никаких rich-тегов
+    # дата в футере — точная дата публикации
+    assert "11.11.2026" in html and "опубликовано" in html
+    # сдержанный футер (только дата публикации) и никаких rich-тегов
     assert html.endswith("</i>") and "<i>опубликовано" in html
     for tag in ("<tg-button", "<details", "<table", "<h3", "<tg-button-row"):
         assert tag not in html, f"rich-тег {tag} попал в классическую карточку"

@@ -437,7 +437,7 @@ def parse_vacancy_text(text: str) -> Vacancy:
         location=location,
         skills=skills,
         description=description,
-        date_posted=date.today().isoformat(),  # футер «опубликовано сегодня»
+        date_posted=date.today().isoformat(),  # футер «опубликовано DD.MM.YYYY»
         contacts=contacts,
         feed_key="manual",
         feed_label="✍️ из вашего текста",

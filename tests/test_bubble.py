@@ -34,7 +34,7 @@ def test_bubble_structure():
     assert '<div class="sal">4 500 – 6 500 USD/мес</div>' in html
     # панель фактов
     assert '<span>Формат</span><b>Global Remote</b>' in html
-    assert '<span>Стек</span><b>solidity' in html
+    assert '<span>Навыки</span><b>solidity' in html
     # панель рекрутера + доп. контакты выделяемым текстом (без ссылок t.me)
     assert "👤 Рекрутер" in html and "@demo_recruiter" in html
     assert "Ещё в Telegram: @chaindemo_hr" in html
