@@ -99,7 +99,10 @@ jobs:
             echo "Состояние не изменилось"
           else
             git commit -m "chore(bot): состояние БД [skip ci]"
-            git pull --rebase --autostash || true
+            # БД бинарная: обычный rebase умирает на конфликте «HEAD vs. [skip ci]»
+            # и хвост состояния рана терялся. -X theirs — в конфликте побеждает
+            # НАШ (более свежий) вариант: замещённый ран жил позже remote-типа.
+            git pull --rebase -X theirs --autostash || true
             git push || echo "⚠️ Не удалось запушить БД (продолжаем)"
           fi
 
