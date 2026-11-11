@@ -16,12 +16,16 @@ from .sender import VacancySender
 log = logging.getLogger("hirify.monitor")
 
 COOKIE_WARN_COOLDOWN_SEC = 6 * 3600  # не чаще раза в 6 часов
+AUTOMATION_WARN_COOLDOWN_SEC = 6 * 3600
 NUDGE_COOLDOWN_SEC = 60              # /start не должен дёргать фид чаще раза в минуту
 MAX_FETCH_ATTEMPTS = 3               # столько раз пробуем загрузить страницу вакансии
 MAX_SEND_ATTEMPTS = 10               # потолок ретраев доставки (send_failed → failed)
-# Сайт помечает «автоматизацию» → контакты закрыты на ~24 ч. Долбить дальше
-# бессмысленно и вредно: ждём час-полтора и пробуем снова (вакансии не сгорают).
-AUTOMATION_COOLDOWN_SEC = 90 * 60
+# Сайт помечает «автоматизацию» → доступ к вакансиям закрыт на ~24 ч. Долбить
+# дальше бессмысленно и, похоже, вредно (каждая попытка может продлевать
+# ограничение), поэтому пауза эскалируется с каждым повторным срабатыванием.
+# Живёт пауза в БД: раны замещают друг друга — в памяти она бы терялась, и
+# каждый новый ран снова дёргал бы закрытый API через минуту после старта.
+AUTOMATION_BACKOFF_MIN = (90, 240, 480, 960, 1440)   # мин, с эскалацией
 
 
 class Monitor:
@@ -31,8 +35,11 @@ class Monitor:
         self.db = db
         self.sender = sender
         self._last_cookie_warn = 0.0
+        self._last_automation_warn = 0.0
         self._last_poll_ts = 0.0
-        self._automation_until = 0.0    # до этого момента сайт просит «не автоматизировать»
+        # пауза после флага автоматизации — из БД (переживает замещение ранов)
+        self._automation_until = self._load_ts("automation_until")
+        self._automation_flag_count = int(self._load_ts("automation_flags"))
         self._running = False
         self._busy = False
         self._wake = asyncio.Event()
@@ -47,6 +54,11 @@ class Monitor:
     def last_poll_ts(self) -> float:
         """Когда закончился последний проход (для кулдауна /fresh)."""
         return self._last_poll_ts
+
+    @property
+    def automation_left_sec(self) -> float:
+        """Сколько ещё держится пауза после флага автоматизации (для /status и /fresh)."""
+        return max(0.0, self._automation_until - time.time())
 
     # ---------------------------------------------------------------- API
 
@@ -102,6 +114,11 @@ class Monitor:
             "Мониторинг запущен: базовый интервал %.0f мин., повтор после находки — через %.0f c",
             self.cfg.poll_minutes, self.cfg.fast_poll_sec,
         )
+        if self._automation_until > time.time():
+            log.warning(
+                "Подхватил паузу после флага автоматизации из БД (ещё %.0f мин) — вакансии подождут",
+                self.automation_left_sec / 60,
+            )
         while self._running:
             wait = self.cfg.poll_minutes * 60
             if not self.paused:
@@ -122,6 +139,7 @@ class Monitor:
         return {
             "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
             "fetch_failed": 0, "send_failed": 0, "no_audience": 0, "cookie_warn": False,
+            "automation_pause": False,
         }
 
     @staticmethod
@@ -143,7 +161,7 @@ class Monitor:
         """Один проход: фид → новые → парсинг → отправка подписчикам.
 
         Возвращает счётчики {total, sent, skipped, filtered, failed,
-        fetch_failed, send_failed, no_audience, cookie_warn}.
+        fetch_failed, send_failed, no_audience, cookie_warn, automation_pause}.
         """
         max_jobs = limit if limit is not None else self.cfg.max_per_poll
         if self._busy:
@@ -208,7 +226,8 @@ class Monitor:
         # дёшево и не карается), но вакансии не трогаем до конца паузы
         if time.time() < self._automation_until:
             log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии подождут",
-                     (self._automation_until - time.time()) / 60)
+                     self.automation_left_sec / 60)
+            stats["automation_pause"] = True
             return stats
 
         # 3) открываем каждую страницу вакансии, ищем контакты
@@ -219,67 +238,15 @@ class Monitor:
         for job_id, slug, url, feed in fresh:
             self.db.add_job(job_id, slug, url)
             stats["total"] += 1
+            full_slug = f"{job_id}-{slug}"
+            # --- этап 1: данные вакансии (GET). Фильтры ниже решаемы уже по
+            # ним — контакты запрашиваем только для прошедших отбор
             try:
-                # данные и контакты — из JSON-API (страницы вакансий рендерит
-                # клиентский JS, парсить их бессмысленно; API отдаёт всё разом).
-                # Слаг в фиде хранится без числового префикса — API ждёт полный.
-                full_slug = f"{job_id}-{slug}"
                 data = await self.client.fetch_vacancy(full_slug)
-                contacts_data = await self.client.fetch_contacts(full_slug)
-                v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
-            except HirifyAutomationError as e:
-                # сайт пометил аккаунт: контакты закрыты ~на 24 ч. Длинная
-                # пауза — вакансии остаются fetch_failed и вернутся позже,
-                # попытки НЕ сгорают (bump не делаем)
-                log.warning("Сайт заподозрил автоматизацию — пауза %d мин: %s",
-                            AUTOMATION_COOLDOWN_SEC // 60, e)
-                self._automation_until = time.time() + AUTOMATION_COOLDOWN_SEC
-                self.db.mark_job(job_id, "fetch_failed")
-                stats["fetch_failed"] += 1
-                break
-            except HirifyRestrictedError as e:
-                # премиум-вакансия или лимит бесплатных просмотров контактов —
-                # ретраить бессмысленно, финализируем без рассылки
-                log.info("job %d: контакты недоступны (403) — пропускаю: %s", job_id, e)
-                self.db.mark_job(job_id, "skipped_restricted")
-                stats["filtered"] += 1
-                continue
-            except HirifyNotFound as e:
-                log.warning("Вакансия недоступна (удалена?): %s", e)
-                self.db.mark_job(job_id, "failed")
-                stats["failed"] += 1
-                continue
-            except HirifyAuthError as e:
-                # сессия не работает: без неё контакты не получить — предупредим
-                # админа и оставим вакансию на ретрай (когда cookie оживёт)
-                log.error("Сессия hirify.me не принимается (%s) — обновите cookie", e)
-                stats["cookie_warn"] = True
-                self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
-                self.db.mark_job(job_id, "fetch_failed")
-                stats["fetch_failed"] += 1
-                continue
-            except HirifyError as e:
-                # сеть/таймаут/5xx — попробуем в следующем проходе (до MAX_FETCH_ATTEMPTS)
-                attempts = self.db.bump_job_attempts(job_id)
-                if attempts >= MAX_FETCH_ATTEMPTS:
-                    self.db.mark_job(job_id, "failed")
-                    stats["failed"] += 1
-                else:
-                    self.db.mark_job(job_id, "fetch_failed")
-                    stats["fetch_failed"] += 1
-                log.warning("Не удалось загрузить %s (попытка %d/%d): %s",
-                            url, attempts, MAX_FETCH_ATTEMPTS, e)
-                continue
-            except Exception:  # noqa: BLE001 — неожиданный формат данных/сбой парсинга
-                # без этого ретраи 'new'-статуса могли бы зациклиться на битой вакансии
-                log.exception("job %d: непредвиденная ошибка обработки — на ретрай", job_id)
-                attempts = self.db.bump_job_attempts(job_id)
-                if attempts >= MAX_FETCH_ATTEMPTS:
-                    self.db.mark_job(job_id, "failed")
-                    stats["failed"] += 1
-                else:
-                    self.db.mark_job(job_id, "fetch_failed")
-                    stats["fetch_failed"] += 1
+                v = vacancy_from_api(data, None, feed.key, feed.label)
+            except Exception as e:  # noqa: BLE001
+                if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
+                    break
                 continue
 
             # помеченные сайтом как скам/подозрительные — не рассылаем
@@ -289,19 +256,7 @@ class Monitor:
                 log.info("job %d: помечен как скам — пропускаю", job_id)
                 continue
 
-            self.db.update_job_parsed(
-                job_id, title=v.title, company=v.company, salary=v.salary,
-                tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
-            )
-
-            # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
-            # (фид уже фильтрует only_direct_contact — это страховка; проблемы
-            # с самой сессией ловятся выше как HirifyAuthError)
-            if not v.has_direct_contact:
-                self.db.mark_job(job_id, "skipped_no_contact")
-                stats["skipped"] += 1
-                log.debug("job %d: TG-контакта нет — пропускаю", job_id)
-                continue
+            self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
 
             # ФИЛЬТР 2: строгая проверка раздела (страховка поверх серверных лендингов)
             if feed.key in ("remote", "global", "crypto_remote") and self.cfg.remote_strict and v.is_non_remote:
@@ -316,15 +271,17 @@ class Monitor:
                 continue
 
             # ФИЛЬТР 3: только целевые индустрии (iGaming/гемблинг/беттинг/
-            # дейтинг/high-risk/NDA-проекты/крипта и смежные). Вакансии «обычных»
-            # компаний не рассылаются — финализируем без доставки
+            # дейтинг/high-risk/NDA-проекты/крипта и смежные). Решается по
+            # данным вакансии — БЕЗ запроса контактов: просмотры контактов
+            # сайт считает, и именно они чаще всего и вызывают флаг «автоматизации»
             if self.cfg.industry_strict and not v.is_target_industry:
                 self.db.mark_job(job_id, "skipped_off_industry")
                 stats["filtered"] += 1
                 log.debug("job %d: целевых индустрий нет — пропускаю", job_id)
                 continue
 
-            # рассылка: только тем, кто выбрал этот раздел в /settings
+            # рассылка: только тем, кто выбрал этот раздел в /settings. Если
+            # адресатов нет — контакты не запрашиваем вовсе (просмотры не бесплатны)
             recipients = self._recipients_for(v, subscribers)
             if not recipients:
                 # вакансия валидна, но ни одному подписчику не интересна —
@@ -334,6 +291,32 @@ class Monitor:
                 log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
                           job_id, v.feed_key)
                 continue
+
+            # --- этап 2: контакты (POST) — единственный «дорогой» запрос,
+            # делаем его только для целевой вакансии с адресатами
+            try:
+                contacts_data = await self.client.fetch_contacts(full_slug)
+            except Exception as e:  # noqa: BLE001
+                if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
+                    break
+                continue
+
+            v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
+            self._automation_healed(subscribers)  # полный просмотр прошёл — флага больше нет
+            self.db.update_job_parsed(
+                job_id, title=v.title, company=v.company, salary=v.salary,
+                tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
+            )
+
+            # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
+            # (фид уже фильтрует only_direct_contact — это страховка; проблемы
+            # с самой сессией ловятся выше как HirifyAuthError)
+            if not v.has_direct_contact:
+                self.db.mark_job(job_id, "skipped_no_contact")
+                stats["skipped"] += 1
+                log.debug("job %d: TG-контакта нет — пропускаю", job_id)
+                continue
+
             # считаем доставки — если НЕ УДАЛОСЬ НИ ОДНОЙ, вакансия
             # не финализируется (send_failed) и уйдёт ретраем в следующем проходе
             delivered = 0
@@ -368,6 +351,90 @@ class Monitor:
 
     # ---------------------------------------------------------------- helpers
 
+    def _load_ts(self, key: str) -> float:
+        """Число из settings (пусто/мусор → 0): пауза автоматизации живёт в БД."""
+        raw = (self.db.get_setting(key) or "0").strip() or "0"
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _handle_fetch_error(
+        self, e: Exception, job_id: int, url: str, stats: dict, subscribers: list[dict],
+    ) -> str:
+        """Единая обработка ошибок загрузки данных/контактов вакансии.
+
+        Возвращает действие для цикла: 'break' — сайт пометил автоматизацию,
+        проход останавливаем до конца паузы; 'continue' — вакансия учтена,
+        идём дальше.
+        """
+        if isinstance(e, HirifyAutomationError):
+            # сайт пометил аккаунт: вакансии закрыты ~на 24 ч. Пауза с
+            # эскалацией и в БД — попытки НЕ сгорают (bump не делаем)
+            count = self._automation_flag_count + 1
+            minutes = AUTOMATION_BACKOFF_MIN[min(count - 1, len(AUTOMATION_BACKOFF_MIN) - 1)]
+            self._automation_flag_count = count
+            self._automation_until = time.time() + minutes * 60
+            self.db.set_setting("automation_until", str(int(self._automation_until)))
+            self.db.set_setting("automation_flags", str(count))
+            log.warning("Сайт заподозрил автоматизацию (срабатывание №%d) — пауза %d мин: %s",
+                        count, minutes, e)
+            self._warn_automation([s["chat_id"] for s in subscribers[:1]], minutes)
+            self.db.mark_job(job_id, "fetch_failed")
+            stats["fetch_failed"] += 1
+            return "break"
+        if isinstance(e, HirifyRestrictedError):
+            # премиум-вакансия или лимит бесплатных просмотров контактов —
+            # ретраить бессмысленно, финализируем без рассылки
+            log.info("job %d: контакты недоступны (403) — пропускаю: %s", job_id, e)
+            self.db.mark_job(job_id, "skipped_restricted")
+            stats["filtered"] += 1
+            return "continue"
+        if isinstance(e, HirifyNotFound):
+            log.warning("Вакансия недоступна (удалена?): %s", e)
+            self.db.mark_job(job_id, "failed")
+            stats["failed"] += 1
+            return "continue"
+        if isinstance(e, HirifyAuthError):
+            # сессия не работает: без неё контакты не получить — предупредим
+            # админа и оставим вакансию на ретрай (когда cookie оживёт)
+            log.error("Сессия hirify.me не принимается (%s) — обновите cookie", e)
+            stats["cookie_warn"] = True
+            self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
+            self.db.mark_job(job_id, "fetch_failed")
+            stats["fetch_failed"] += 1
+            return "continue"
+        # сеть/таймаут/5xx/битый формат данных — ретрай в следующем проходе
+        attempts = self.db.bump_job_attempts(job_id)
+        if attempts >= MAX_FETCH_ATTEMPTS:
+            self.db.mark_job(job_id, "failed")
+            stats["failed"] += 1
+        else:
+            self.db.mark_job(job_id, "fetch_failed")
+            stats["fetch_failed"] += 1
+        if isinstance(e, HirifyError):
+            log.warning("Не удалось загрузить %s (попытка %d/%d): %s",
+                        url, attempts, MAX_FETCH_ATTEMPTS, e)
+        else:
+            # без этого ретраи 'new'-статуса могли бы зациклиться на битой вакансии
+            log.exception("job %d: непредвиденная ошибка обработки — на ретрай", job_id)
+        return "continue"
+
+    def _automation_healed(self, subscribers: list[dict]) -> None:
+        """Первый успешный полный просмотр после флага — сайт снял ограничение."""
+        if not self._automation_flag_count:
+            return
+        self._automation_flag_count = 0
+        self._automation_until = 0.0
+        self.db.set_setting("automation_until", "0")
+        self.db.set_setting("automation_flags", "0")
+        log.info("Флаг автоматизации снят сайтом — работаем в обычном режиме")
+        from . import texts
+
+        self._fire_and_forget_text(
+            [s["chat_id"] for s in subscribers[:1]], texts.AUTOMATION_LIFTED,
+        )
+
     def _warn_cookie(self, recipients: list[int]) -> None:
         """Одно напоминание в 6 часов, если контакты выглядят скрытыми."""
         now = time.time()
@@ -376,10 +443,24 @@ class Monitor:
         self._last_cookie_warn = now
         from . import texts
 
+        self._fire_and_forget_text(recipients, texts.COOKIE_HINT)
+
+    def _warn_automation(self, recipients: list[int], minutes: int) -> None:
+        """Одно сообщение в 6 часов, если сайт держит флаг автоматизации."""
+        now = time.time()
+        if now - self._last_automation_warn < AUTOMATION_WARN_COOLDOWN_SEC:
+            return
+        self._last_automation_warn = now
+        from . import texts
+
+        self._fire_and_forget_text(recipients, texts.AUTOMATION_HINT.format(minutes=minutes))
+
+    def _fire_and_forget_text(self, recipients: list[int], html: str) -> None:
+        """Отправить текстовое сообщение фоново (не роняя проход мониторинга)."""
         async def _task() -> None:
             for chat_id in recipients[:1]:
                 try:
-                    await self.sender.send_text(chat_id, texts.COOKIE_HINT)
+                    await self.sender.send_text(chat_id, html)
                 except Exception:  # noqa: BLE001
                     pass
 

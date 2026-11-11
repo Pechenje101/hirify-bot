@@ -143,6 +143,11 @@ async def cmd_fresh(message: Message, command: CommandObject, services: Services
         return
     await message.answer(texts.FRESH_STARTED)
     stats = await services.monitor.poll_once(source="manual", limit=limit)
+    if stats.get("automation_pause"):
+        # сайт держит флаг автоматизации: честно объясняем, а не «не нашлось»
+        left = int(services.monitor.automation_left_sec / 60)
+        await message.answer(texts.FRESH_AUTOMATION.format(left=left))
+        return
     extra = ""
     if stats.get("no_audience"):
         extra = (
@@ -175,6 +180,11 @@ async def cmd_stats(message: Message, services: Services):
 @router.message(Command("status"))
 async def cmd_status(message: Message, services: Services):
     paused = "⏸ выключен (/resume — включить)" if services.monitor.paused else "▶️ работает"
+    automation_left = services.monitor.automation_left_sec
+    automation = (
+        f"🛡 ещё {automation_left / 60:.0f} мин (сайт закрыл просмотры)"
+        if automation_left > 0 else "нет"
+    )
     fmt = (
         "Bubble/Rich/Классика — у каждого свой выбор в /settings"
         if services.cfg.use_widget and services.cfg.use_rich
@@ -189,6 +199,7 @@ async def cmd_status(message: Message, services: Services):
             feeds=html_mod.escape(feeds),
             cookie=_fmt_cookie(services.client),
             rich=fmt,
+            automation=automation,
             subs=len(services.db.subscriber_ids()),
             params=html_mod.escape(services.cfg.feed_params),
         ),

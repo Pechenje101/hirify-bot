@@ -213,14 +213,15 @@ def test_subscriber_feed_filter_excludes_other_sections():
     mon, client, sender, db = make_monitor()  # cfg feeds = "remote"
     db.update_subscriber_settings(1, feeds=["global"], silent=False)
     stats = asyncio.run(mon.poll_once(source="test"))
-    # вакансии валидны и обработаны, но адресата в разделе remote нет:
-    # 2 с контактом — no_audience, 1 без контакта — skipped
-    assert stats["total"] == 3 and stats["no_audience"] == 2 and stats["sent"] == 0
-    assert stats["skipped"] == 1
+    # адресатов раздела remote нет — все три обработаны без доставки и
+    # БЕЗ запроса контактов (просмотры контактов сайт считает — не жжём их):
+    # фильтры решаются по данным вакансии, а адресатов проверяем до контактов
+    assert stats["total"] == 3 and stats["no_audience"] == 3 and stats["sent"] == 0
+    assert stats["skipped"] == 0
     assert sender.sent == []
     # финализированы без бесконечных ретраев
     assert db.job_status(101) == "sent"
-    assert client.job_fetches == 3  # API по каждой всё равно дёрнули один раз
+    assert client.job_fetches == 3  # данные вакансии по каждой — один раз
     # вернули «все разделы» — в новом проходе вакансии бы ушли, но они уже known
     db.update_subscriber_settings(1, feeds=None, silent=False)
     stats2 = asyncio.run(mon.poll_once(source="test"))
@@ -387,10 +388,12 @@ def test_off_industry_vacancies_are_filtered():
     mon.cfg.industry_strict = True
     mon.client = FakeClient(feed, api)
     stats = asyncio.run(mon.poll_once(source="test"))
-    # 101 (крипта) и 104 (спортсбук) — целевые; 102 — обычный фронт: отфильтрован
-    assert stats["filtered"] == 1
+    # 101 (крипта) и 104 (спортсбук) — целевые; 102 (фронт) и 103 (без индустрии
+    # и без контакта — фильтры теперь до запроса контактов) — отфильтрованы
+    assert stats["filtered"] == 2
     assert sender.sent == [(1, "Solidity Engineer"), (1, "Sportsbook Backend Developer")]
     assert db.job_status(102) == "skipped_off_industry"
+    assert db.job_status(103) == "skipped_off_industry"
     assert db.job_status(104) == "sent"
     db.close()
 
@@ -477,4 +480,71 @@ def test_automation_flag_stops_poll_and_retries_later():
     stats2 = asyncio.run(mon.poll_once(source="test"))
     assert stats2["sent"] == 2
     assert db.job_status(101) == "sent"
+    db.close()
+
+
+def test_automation_backoff_escalates_and_survives_restart():
+    """Пауза автоматизации живёт в БД (переживает замещение ранов) и растёт
+    с каждым повторным срабатыванием — не кормим флаг постоянными попытками."""
+    from app.hirify import HirifyAutomationError
+    from app.monitor import AUTOMATION_BACKOFF_MIN
+
+    class FlaggedClient(FakeClient):
+        async def fetch_contacts(self, slug):
+            raise HirifyAutomationError("сайт заподозрил автоматизацию (HTTP 403)")
+
+    mon, _, _, db = make_monitor()
+    mon.client = FlaggedClient(FEED_ITEMS, VACANCIES)
+    asyncio.run(mon.poll_once(source="test"))
+    first = mon._automation_until
+    assert 89 * 60 < first - time.time() <= 90 * 60  # первая ступень — 90 мин
+    assert db.get_setting("automation_flags", "") == "1"
+    assert db.get_setting("automation_until", "") == str(int(first))
+
+    # «ран заместился»: новый Monitor над той же БД подхватывает паузу из settings
+    mon2 = Monitor(mon.client, db, mon.sender, mon.cfg)
+    assert mon2._automation_until == int(first)
+    assert mon2._automation_flag_count == 1
+
+    # второе срабатывание — ступень выше (240 мин), счётчик в БД растёт
+    mon2._automation_until = 0.0  # имитируем истечение паузы
+    asyncio.run(mon2.poll_once(source="test"))
+    second = mon2._automation_until
+    assert 239 * 60 < second - time.time() <= 240 * 60
+    assert db.get_setting("automation_flags", "") == "2"
+
+    # успешный полный просмотр — счётчик и пауза сбрасываются (флаг снят)
+    mon2._automation_flag_count = 1
+    mon2._automation_until = 0.0  # пауза истекла — пробуем, сайт уже здоров
+    healed = FakeClient(FEED_ITEMS, VACANCIES)
+    mon2.client = healed
+    stats = asyncio.run(mon2.poll_once(source="test"))
+    assert stats["sent"] == 2
+    assert mon2._automation_flag_count == 0 and mon2._automation_until == 0.0
+    assert db.get_setting("automation_flags", "") == "0"
+    db.close()
+
+
+def test_off_industry_job_never_requests_contacts():
+    """Индустриальный фильтр решается по данным вакансии: «дорогой» POST
+    контактов делаем только для целевых вакансий."""
+
+    class SpyClient(FakeClient):
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.contact_fetches: list[str] = []
+
+        async def fetch_contacts(self, slug):
+            self.contact_fetches.append(slug)
+            return await super().fetch_contacts(slug)
+
+    mon, _, _, db = make_monitor()
+    mon.cfg.industry_strict = True  # боевое значение
+    spy = SpyClient(FEED_ITEMS, VACANCIES)
+    mon.client = spy
+    stats = asyncio.run(mon.poll_once(source="test"))
+    # 101 (Solidity — крипта) — целевая; 102 (фронтенд) и 103 — мимо индустрии
+    assert stats["filtered"] == 2 and stats["sent"] == 1
+    assert spy.contact_fetches == ["101-senior-solidity-engineer"]
+    assert db.job_status(102) == "skipped_off_industry"
     db.close()
