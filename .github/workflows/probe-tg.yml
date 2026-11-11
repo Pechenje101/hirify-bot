@@ -1,0 +1,25 @@
+name: probe-tg
+
+# Живая проба Telegram Bot API: принимает ли сервер sendWidget (пузыри,
+# Bot API 10.4) и sendRichMessage (10.1) с нашими карточками.
+# Пишет в несуществующий chat_id=1: сообщения никуда не уходят, но сервер
+# успевает провалидировать метод, параметры и html.
+# Запуск вручную (workflow_dispatch); токен — секрет BOT_TOKEN, в лог не печатается.
+on:
+  workflow_dispatch:
+
+jobs:
+  tg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+      - name: "Живая проба: getMe / sendWidget / sendRichMessage"
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python tools/probe_telegram.py
