@@ -249,10 +249,16 @@ class Monitor:
         feeds=None — «по умолчанию» (все разделы бота); пустое множество —
         человек выключил всё; иначе — выбранные в /settings разделы.
         """
+        return Monitor._recipients_for_key(v.feed_key, subscribers)
+
+    @staticmethod
+    def _recipients_for_key(feed_key: str, subscribers: list[dict]) -> list[dict]:
+        """То же по ключу раздела (без вакансии): фильтр адресатов ДО
+        открытия вакансии — не тратить ни GET, ни просмотры аккаунта."""
         out: list[dict] = []
         for s in subscribers:
             feeds = s.get("feeds")
-            if feeds is not None and (v.feed_key or "") not in feeds:
+            if feeds is not None and (feed_key or "") not in feeds:
                 continue
             out.append(s)
         return out
@@ -443,6 +449,16 @@ class Monitor:
                 log.debug("job %d: префильтр фида → %s (без открытия вакансии)", job_id, reason)
                 continue
 
+            # Адресатов нет — не открываем вовсе: ни анонимный GET, ни
+            # auth-просмотры (feed_key вакансии = раздел, где она найдена)
+            recipients = self._recipients_for_key(feed.key, subscribers)
+            if not recipients:
+                self.db.mark_job(job_id, "sent")
+                stats["no_audience"] += 1
+                log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
+                          job_id, feed.key)
+                continue
+
             # --- АНОНИМНЫЙ ПУТЬ: публичная страница вакансии БЕЗ cookie.
             # SEO-JSON-LD лендинга несёт ПОЛНОЕ описание вакансии, включая
             # блок «Контакты: Telegram @handle», поэтому большинство вакансий
@@ -462,13 +478,6 @@ class Monitor:
                         self.db.mark_job(job_id, skip)
                         stats["filtered"] += 1
                         log.debug("job %d: строгий фильтр по публичным данным → %s", job_id, skip)
-                        continue
-                    recipients = self._recipients_for(v, subscribers)
-                    if not recipients:
-                        self.db.mark_job(job_id, "sent")
-                        stats["no_audience"] += 1
-                        log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
-                                  job_id, v.feed_key)
                         continue
                     self.db.update_job_parsed(
                         job_id, title=v.title, company=v.company, salary=v.salary,
@@ -529,17 +538,8 @@ class Monitor:
                 log.debug("job %d: строгий фильтр → %s", job_id, skip)
                 continue
 
-            # рассылка: только тем, кто выбрал этот раздел в /settings. Если
-            # адресатов нет — контакты не запрашиваем вовсе (просмотры не бесплатны)
-            recipients = self._recipients_for(v, subscribers)
-            if not recipients:
-                # вакансия валидна, но ни одному подписчику не интересна —
-                # финализируем (иначе гоняла бы ретраями до бесконечности)
-                self.db.mark_job(job_id, "sent")
-                stats["no_audience"] += 1
-                log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
-                          job_id, v.feed_key)
-                continue
+            # рассылка: адресаты уже отобраны до открытия; контакты запрашиваем
+            # только после всех фильтров (просмотры не бесплатны)
 
             # --- этап 2: контакты (POST, от имени аккаунта) — «дорогой» запрос,
             # делаем его только для целевой вакансии с адресатами

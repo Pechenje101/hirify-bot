@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -159,9 +160,14 @@ class HirifyClient:
         if self._curl is not None or self._httpx is not None:
             return
         target = (getattr(self.cfg, "impersonate_target", "") or "chrome").strip()
+        proxy = (getattr(self.cfg, "hirify_proxy", "") or "").strip() or None
+        if proxy:
+            # креды прокси в лог не светим: scheme://***@host:port
+            masked = re.sub(r"//[^@/]+@", "://***@", proxy)
+            log.info("Запросы к hirify через прокси %s (стабильный IP вместо датацентра Actions)", masked)
         if HAS_CURL_CFFI:
             try:
-                self._curl = CurlAsyncSession(impersonate=target)  # type: ignore[misc]
+                self._curl = CurlAsyncSession(impersonate=target, proxy=proxy)  # type: ignore[misc]
                 self.engine = f"curl_cffi({target})"
                 log.info("Двигатель запросов: curl_cffi, имперсонация %s (TLS/HTTP2 как Chrome)", target)
             except Exception as e:  # noqa: BLE001 - любая ошибка инициализации
@@ -174,6 +180,7 @@ class HirifyClient:
                     timeout=self.cfg.request_timeout_sec,
                     follow_redirects=True,
                     http2=True,
+                    proxy=proxy,
                 )
                 self.engine = "httpx+h2"
             except ImportError:
@@ -182,6 +189,7 @@ class HirifyClient:
                     timeout=self.cfg.request_timeout_sec,
                     follow_redirects=True,
                     http2=False,
+                    proxy=proxy,
                 )
                 self.engine = "httpx"
             log.info("Двигатель запросов: %s", self.engine)

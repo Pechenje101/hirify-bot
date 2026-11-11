@@ -231,14 +231,15 @@ def test_subscriber_feed_filter_excludes_other_sections():
     db.update_subscriber_settings(1, feeds=["global"], silent=False)
     stats = asyncio.run(mon.poll_once(source="test"))
     # адресатов раздела remote нет — все три обработаны без доставки и
-    # БЕЗ запроса контактов (просмотры контактов сайт считает — не жжём их):
-    # фильтры решаются по данным вакансии, а адресатов проверяем до контактов
+    # БЕЗ единого запроса (ни API вакансий, ни контактов): адресаты
+    # проверяются ДО открытия — просмотры аккаунта не тратятся вовсе
     assert stats["total"] == 3 and stats["no_audience"] == 3 and stats["sent"] == 0
     assert stats["skipped"] == 0
     assert sender.sent == []
     # финализированы без бесконечных ретраев
     assert db.job_status(101) == "sent"
-    assert client.job_fetches == 3  # данные вакансии по каждой — один раз
+    assert client.job_fetches == 0  # ни одна вакансия не открывалась
+    assert client.landing_fetches == 0  # и анонимный лендинг тоже не нужен
     # вернули «все разделы» — в новом проходе вакансии бы ушли, но они уже known
     db.update_subscriber_settings(1, feeds=None, silent=False)
     stats2 = asyncio.run(mon.poll_once(source="test"))
