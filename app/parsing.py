@@ -525,10 +525,23 @@ def parse_job_page(html: str, url: str) -> Vacancy:
     links = _collect_link_contacts(html, page_text)
     # 3) @упоминания в тексте
     mentions = _collect_mentions(soup)
+    # 4) из ПОЛНОГО описания (JSON-LD SEO): видимая страница прячет контакты
+    #    за «Show contacts», но SEO-разметка несёт текст целиком — блок
+    #    «Контакты: Telegram @handle» доезжает анонимно, без API и cookie
+    desc_contacts: list[TGContact] = []
+    if v.description:
+        desc_contacts = _collect_link_contacts(v.description, "")
+        for m in MENTION_RE.finditer(v.description):
+            u = _clean_username(m.group(1))
+            low = u.lower()
+            if low in MENTION_BLOCKLIST or low in HIRIFY_USERNAMES or low in TG_SERVICE_PATHS:
+                continue
+            desc_contacts.append(
+                TGContact("username", u, f"@{u}", f"https://t.me/{u}", "mention"))
 
     merged: list[TGContact] = []
     seen: set[str] = set()
-    for c in sec + links + mentions:
+    for c in sec + links + mentions + desc_contacts:
         key = f"{c.kind}:{c.value.lower()}"
         if key in seen:
             continue

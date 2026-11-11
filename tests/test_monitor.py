@@ -73,6 +73,8 @@ class FakeClient:
         self.api = api
         self.feed_fetches = 0
         self.job_fetches = 0
+        self.landing_fetches = 0
+        self.landing_html: dict[str, str] = {}   # slug → HTML публичной страницы
 
     async def fetch_feed_api(self, feed, page: int = 1) -> list:
         self.feed_fetches += 1
@@ -84,6 +86,15 @@ class FakeClient:
 
     async def fetch_contacts(self, slug: str) -> dict:
         return self.api[slug][1]
+
+    async def fetch_job(self, url: str) -> str:
+        """Публичная страница вакансии (анонимный GET лендинга).
+
+        По умолчанию — пустая страница (контакта нет) → бот уходит в
+        auth-путь, как раньше. Тесты кладут HTML с JSON-LD в landing_html."""
+        self.landing_fetches += 1
+        slug = url.rstrip("/").rsplit("/", 1)[-1]
+        return self.landing_html.get(slug, "")
 
 
 class FakeSender:
@@ -849,10 +860,11 @@ def test_auth_hour_quota_defers_rest_of_batch():
 
     stats = asyncio.run(mon.poll_once(source="test"))
     # 101-я открыта и отправлена; 102 и 103 отложены (102: 2 «просмотра»
-    # — данные+контакты — уже потрачены)
+    # — данные+контакты — уже потрачены). Анонимный лендинг пуст → auth-путь;
+    # строки добавлены как 'new' и вернутся ретраем
     assert stats["sent"] == 1 and stats["quota_deferred"] >= 1
     assert db.job_status(101) == "sent"
-    assert db.job_status(102) is None and db.job_status(103) is None  # не тронуты
+    assert db.job_status(102) in (None, "new") and db.job_status(103) in (None, "new")
 
     mon._auth_hour_ts.clear()                # «прошёл час» — окно скользнуло
     stats2 = asyncio.run(mon.poll_once(source="test"))
@@ -869,14 +881,14 @@ def test_auth_day_quota_persists_in_db():
     mon.cfg.auth_views_day_max = 1
     asyncio.run(mon.poll_once(source="test"))
     assert db.get_setting("auth_views_count", "") == "2"   # 101: данные+контакты
-    assert db.job_status(102) is None                       # квота: не тронута
+    assert db.job_status(102) in (None, "new")              # квота: только add_job, auth нет
 
     # «новый ран»: Monitor над той же БД видит потраченную квоту
     mon2 = Monitor(mon.client, db, mon.sender, mon.cfg)
     mon2._auth_hour_ts.clear()
     stats = asyncio.run(mon2.poll_once(source="test"))
     assert stats["quota_deferred"] >= 1
-    assert db.job_status(102) is None
+    assert db.job_status(102) in (None, "new")
     db.close()
 
 
@@ -1039,6 +1051,102 @@ SEEKER_POST = "Ищу работу медиабайером, резюме в л�
 
 def _ch_item(mid: int, text: str, created_at: str) -> dict:
     return {"id": mid, "created_at": created_at, "text": text}
+
+
+def _landing(title: str, description: str, company: str = "Acme") -> str:
+    """HTML публичной страницы вакансии: видимая страница прячет контакты
+    («Show contacts»), но SEO-JSON-LD несёт полное описание — как у реального
+    hirify (проверено живой пробой probe.yml)."""
+    import json as _json
+    ld = {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": title,
+        "description": description,
+        "hiringOrganization": {"name": company},
+        "datePosted": "2026-11-11",
+    }
+    return (
+        '<html><head><script type="application/ld+json">'
+        + _json.dumps(ld)
+        + f'</script></head><body><h1>{title}</h1>'
+          '<div>Show contacts</div></body></html>'
+    )
+
+
+def test_anon_first_delivers_without_auth_requests():
+    """Анонимный путь: контакт виден в SEO-JSON-LD публичной страницы →
+    доставка БЕЗ единого запроса от имени аккаунта (анти-флаг)."""
+    mon, client, sender, db = make_monitor()
+    mon.cfg.tg_channels = ""
+    client.feed_items = FEED_ITEMS[:1]
+    client.landing_html["101-senior-solidity-engineer"] = _landing(
+        "Solidity Engineer",
+        "Мы ищем инженера. Контакты: Telegram @acme_crypto_hr "
+        "или https://t.me/acme_crypto_hr",
+    )
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["anon"] == 1
+    assert client.landing_fetches == 1
+    assert client.job_fetches == 0            # API вакансий не открывался вовсе
+    assert db.job_status(101) == "sent"
+    assert sender.sent and sender.sent[0][1].startswith("Solidity Engineer")
+    db.close()
+
+
+def test_anon_fallback_to_auth_when_public_page_has_no_contact():
+    """Контакта на публичной странице нет → прежний auth-путь (API + контакты)."""
+    mon, client, sender, db = make_monitor()
+    mon.cfg.tg_channels = ""
+    client.feed_items = FEED_ITEMS[:1]   # landing_html пуст — контакта нет
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["anon"] == 0
+    assert client.landing_fetches == 1
+    assert client.job_fetches == 1            # вакансия открыта через API
+    assert db.job_status(101) == "sent"
+    db.close()
+
+
+def test_anon_delivers_during_automation_pause():
+    """Флаг аккаунта глушит только auth-путь: вакансия с публичным контактом
+    доставляется и во время паузы; без публичного контакта — ждёт ретрая
+    (статус 'new', свежесть для неё расширена)."""
+    mon, client, sender, db = make_monitor()
+    mon.cfg.tg_channels = ""
+    client.feed_items = FEED_ITEMS            # 101 — публичный контакт, 102/103 — нет
+    client.landing_html["101-senior-solidity-engineer"] = _landing(
+        "Solidity Engineer",
+        "Контакты: Telegram @acme_crypto_hr или https://t.me/acme_crypto_hr",
+    )
+    mon._automation_until = time.time() + 3600
+    mon._automation_last_flag = time.time()
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["automation_pause"] is True
+    assert stats["sent"] == 1 and stats["anon"] == 1
+    assert client.job_fetches == 0            # auth не тронут вовсе
+    assert db.job_status(101) == "sent"
+    assert db.job_status(102) == "new"        # отложена — вернётся ретраем
+    db.close()
+
+
+def test_fresh_threshold_extends_over_recent_automation_pause():
+    """Публикации, застрявшие на время паузы флага, не режутся свежестью:
+    пока флаг горячий, граница не позже момента флага. Остывший флаг —
+    расширения нет (иначе бэклог фида выплеснулся бы как «свежий»)."""
+    from app.monitor import FEED_FRESH_SLACK_SEC
+    mon, _, _, db = make_monitor()
+    mon.cfg.fresh_window_min = 30.0
+    mon._last_poll_ts = 0                     # холодный старт — только жёсткое окно
+    base = mon._fresh_threshold_ts()
+
+    mon._automation_last_flag = time.time() - 3600   # флаг час назад (старше окна) — горячий
+    wider = mon._fresh_threshold_ts()
+    assert wider <= mon._automation_last_flag + FEED_FRESH_SLACK_SEC
+    assert wider < base - 600
+
+    mon._automation_last_flag = time.time() - 48 * 3600   # остывший — не влияет
+    assert abs(mon._fresh_threshold_ts() - base) < 1.0
+    db.close()
 
 
 def _make_channel_monitor(posts: dict[str, list[dict]]):

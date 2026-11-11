@@ -125,6 +125,36 @@ def test_parse_hidden_contacts():
     assert all(c.value.lower() != "media" for c in v.contacts)
 
 
+JOB_HIDDEN_JSONLD_HTML = """<!DOCTYPE html>
+<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@type":"JobPosting",
+ "title":"Enterprise Account Executive (Fintech)",
+ "description":"<p>Что делать: продажи в финтех.</p>\\n<br />📞 <strong>Контакты</strong><br />\\n- Telegram: <b>@fintech_hr</b> или https://t.me/fintech_hr",
+ "datePosted":"2026-11-11",
+ "hiringOrganization":{"@type":"Organization","name":"FinDemo"}}
+</script></head>
+<body>
+<h1>Enterprise Account Executive (Fintech)</h1>
+<p>Name available after authorization</p>
+<button>Show contacts</button>
+</body></html>"""
+
+
+def test_parse_contacts_from_jsonld_description():
+    """Контакты из ПОЛНОГО описания в SEO-JSON-LD: видимая страница прячет
+    их за «Show contacts», но SEO-разметка несёт текст целиком — анонимный
+    путь доставки живёт на этом."""
+    v = parse_job_page(JOB_HIDDEN_JSONLD_HTML,
+                       "https://hirify.me/jobs/1394996-enterprise-fintech-account-executive")
+    assert v.contacts_hidden, "видимая страница прячет контакты"
+    assert v.has_direct_contact, "но в JSON-LD описании контакт есть"
+    vals = {c.value.lower() for c in v.contacts}
+    assert "fintech_hr" in vals
+    p = v.primary_contact
+    assert p and p.kind == "username" and p.value == "fintech_hr"
+    assert p.url == "https://t.me/fintech_hr"
+
+
 def test_parse_userid_contact():
     v = parse_job_page(JOB_USERID_HTML, "https://hirify.me/jobs/555-backend-dev")
     p = v.primary_contact
