@@ -203,8 +203,13 @@ def render_bubble_html(v: Vacancy, limit: int = BUBBLE_DESCRIPTION_LIMIT) -> str
         raw, comp = _widget_size(trimmed)
         if comp <= MAX_COMPRESSED_BYTES and raw <= MAX_RAW_BYTES:
             return trimmed
-    # Последний рубеж: совсем без описания (CSS+шапка+контакт влезают всегда)
-    return render_bubble_html(v, limit=0)
+    # Совсем без описания всё равно не влезает (гигантский заголовок/факты):
+    # хвостовой рекурсии НЕ делаем (путь к бесконечной глубине) — отдаём
+    # ошибку, sender откатит карточку на rich/классику.
+    raise ValueError(
+        "виджет не влезает в лимиты Bot API даже без описания: "
+        f"raw={raw}/{MAX_RAW_BYTES}, zlib-9={comp}/{MAX_COMPRESSED_BYTES}"
+    )
 
 
 def render_bubble_caption(v: Vacancy) -> str:

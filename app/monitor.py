@@ -289,7 +289,6 @@ class Monitor:
                 log.info("job %d: помечен как скам — пропускаю", job_id)
                 continue
 
-            v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
             self.db.update_job_parsed(
                 job_id, title=v.title, company=v.company, salary=v.salary,
                 tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],

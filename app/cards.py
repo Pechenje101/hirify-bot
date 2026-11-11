@@ -45,8 +45,9 @@ E = html_mod.escape
 # Лимиты Telegram на текст карточек:
 #  - sendMessage (классика): 1–4096 символов ПОСЛЕ разбора entities —
 #    считаем «видимую» длину (теги выкидываем, entities разэкранируем);
-#  - sendRichMessage (Bot API 10.1+): html до 32768 символов — сюда описание
-#    помещается целиком, разворачивается <details> прямо в карточке.
+#  - sendRichMessage (Bot API 10.1+): html до 32768 БАЙТ UTF-8 — сюда
+#    описание помещается целиком, разворачивается <details> прямо в карточке
+#    (кириллица — 2 байта на символ, поэтому проверяем байтами, а не len()).
 CLASSIC_TEXT_LIMIT = 4096
 RICH_HTML_LIMIT = 32768
 # Запас на шапку/факты/кнопки в rich-сообщении: описание больше этого —
@@ -280,10 +281,13 @@ def render_rich_html(v: Vacancy, limit: int | None = None) -> str:
     html = _rich_impl(v, desc_limit)
     if limit is None:
         # автоподгонка: описание — единственная переменная часть карточки,
-        # пропорциональное ужимание сходится за 1–2 пересборки
-        while len(html) > RICH_HTML_LIMIT and desc_limit > 500:
-            desc_limit = max(500, int(desc_limit * RICH_HTML_LIMIT / len(html) * 0.97))
+        # пропорциональное ужимание сходится за 1–2 пересборки. Лимит считаем
+        # в БАЙТАХ UTF-8 — так его проверяет сервер Telegram.
+        size = len(html.encode("utf-8"))
+        while size > RICH_HTML_LIMIT and desc_limit > 500:
+            desc_limit = max(500, int(desc_limit * RICH_HTML_LIMIT / size * 0.97))
             html = _rich_impl(v, desc_limit)
+            size = len(html.encode("utf-8"))
     return html
 
 

@@ -167,7 +167,7 @@ async def cmd_stats(message: Message, services: Services):
     await message.answer(
         texts.STATS_TMPL.format(**{k: s.get(k, 0) for k in
                                    ("total", "sent", "sent_today", "skipped", "filtered",
-                                    "failed", "send_failed")}),
+                                    "failed", "fetch_failed", "send_failed")}),
         parse_mode="HTML",
     )
 

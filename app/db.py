@@ -230,7 +230,18 @@ class Database:
             "fetch_failed": by_status.get("fetch_failed", 0),
             "send_failed": by_status.get("send_failed", 0),
             "sent_today": sent_today,
-            "filtered": by_status.get("skipped_not_remote", 0) + by_status.get("skipped_not_crypto", 0),
+            # «Не-рассылательные» группы для /stats: без контакта — отдельно,
+            # всё отсеянное фильтрами (раздел/индустрия/скам/недоступные контакты) — в filtered.
+            # РАНЬШЕ skipped сюда не попадал вовсе, а filtered не знал про
+            # индустриальный фильтр — /stats занижал реальные цифры.
+            "skipped": by_status.get("skipped_no_contact", 0),
+            "filtered": (
+                by_status.get("skipped_not_remote", 0)
+                + by_status.get("skipped_not_crypto", 0)
+                + by_status.get("skipped_off_industry", 0)
+                + by_status.get("skipped_scam", 0)
+                + by_status.get("skipped_restricted", 0)
+            ),
         }
 
     # ---------- подписчики ----------
