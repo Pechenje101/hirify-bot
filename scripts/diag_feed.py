@@ -40,6 +40,7 @@ async def main() -> int:
     print(f"глубина разбора вакансий: первые {DEEP} уникальных со страницы 1\n")
 
     client = HirifyClient(cfg)
+    await client.open()
     links: list[tuple[int, str, str, object]] = []
     code = 0
     try:
