@@ -1,0 +1,28 @@
+name: diag
+
+# Диагностика фида: почему автомониторинг может молчать. Read-only:
+# несколько GET к api.hirify.me с cookie из секретов, контакты (POST) не
+# трогаем, бота не перезапускает (не входит в paths-фильтр bot.yml).
+on:
+  workflow_dispatch:
+
+jobs:
+  feed-funnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Воронка фида (диагностика тишины)
+        env:
+          HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+          DIAG_DEEP: '20'
+        run: python scripts/diag_feed.py
