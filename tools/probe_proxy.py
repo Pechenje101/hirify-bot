@@ -1,21 +1,21 @@
-"""Зонд прокси HIRIFY_PROXY — анонимная проверка «прокси → hirify.me».
+"""Зонд прокси-кандидатов — анонимная проверка «прокси → hirify.me» из Actions.
 
-Проверяет, что прокси из секрета HIRIFY_PROXY реально годится для бота:
-  1) Cloudflare trace через прокси — какой исходящий IP (маскируется);
-  2) анонимный фид api.hirify.me через прокси (curl_cffi, имперсонация Chrome);
-  3) тот же фид через httpx (fallback-двигатель бота).
+Кандидаты берутся из env PROBE_CANDIDATES (запятая-разделённый список,
+задан прямо в workflow — это НЕ секреты, просто публичные адреса). Для
+каждого: Cloudflare trace (исходящий IP, маскируется) + анонимный фид
+api.hirify.me через curl_cffi (имперсонация Chrome), при успехе — ещё httpx.
+В финале печатает BEST=<proxy> — лучший по «фид 200» и минимальному времени.
 
 БЕЗ cookie, БЕЗ запросов к вакансиям/контактам — риска для аккаунта ноль.
-Запуск: workflow_dispatch из .github/workflows/probe-proxy.yml.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 API = "https://api.hirify.me"
 FEED = f"{API}/api/vacancies?work_format=remote&only_direct_contact=1&contact_types=telegram&sort_by=newest&page=1"
@@ -37,56 +37,79 @@ def items_of(data) -> list:
     return data if isinstance(data, list) else []
 
 
-def main() -> int:
-    proxy = (os.getenv("HIRIFY_PROXY") or "").strip()
-    if not proxy:
-        print("!! HIRIFY_PROXY пуст — секрет не задан, проверять нечего")
-        return 1
-    print(f"Прокси: {mask(proxy)}")
-
-    ok_cf = False
+def check(proxy: str) -> dict:
+    out = {"proxy": proxy, "trace": None, "feed": None, "feed_hx": None, "sec": None}
     try:
         from curl_cffi import requests as creq
+        t0 = time.monotonic()
         r = creq.get("https://www.cloudflare.com/cdn-cgi/trace",
-                     proxy=proxy, timeout=15, impersonate="chrome")
+                     proxy=proxy, timeout=12, impersonate="chrome")
+        dt = time.monotonic() - t0
         m = re.search(r"^ip=(.+)$", r.text, re.M)
         loc = re.search(r"^loc=(.+)$", r.text, re.M)
-        ip = (m.group(1).strip() if m else "?")
-        # IP целиком не печатаем — только подсеть /24 (v4) или /64 (v6)
+        ip = m.group(1).strip() if m else "?"
         net = ".".join(ip.split(".")[:3]) + ".x" if "." in ip else ":".join(ip.split(":")[:4]) + "::x"
-        print(f"1) Cloudflare trace через прокси: HTTP {r.status_code}, "
-              f"IP {net}, страна {loc.group(1) if loc else '?'}")
-        ok_cf = r.status_code == 200
+        out["trace"] = f"HTTP {r.status_code} ip={net} loc={loc.group(1) if loc else '?'} {dt:.1f}s"
     except Exception as e:  # noqa: BLE001
-        print(f"1) Cloudflare trace через прокси: ОШИБКА {type(e).__name__}: {e}")
+        out["trace"] = f"ERR {type(e).__name__}"
+        return out
 
-    results = {}
-    for engine in ("curl_cffi", "httpx"):
-        t0 = time.monotonic()
-        try:
-            if engine == "curl_cffi":
-                from curl_cffi import requests as creq
-                r = creq.get(FEED, proxy=proxy, timeout=30, impersonate="chrome",
-                             headers=HEADERS)
-                status, body, ver = r.status_code, r.text, getattr(r, "http_version", "?")
-            else:
-                import httpx
-                with httpx.Client(proxy=proxy, timeout=30.0, follow_redirects=True,
-                                  http2=True, headers=HEADERS) as c:
-                    rr = c.get(FEED)
-                status, body, ver = rr.status_code, rr.text, getattr(rr, "http_version", "?")
-            dt = time.monotonic() - t0
-            n = len(items_of(json.loads(body))) if status == 200 else -1
-            results[engine] = status
-            print(f"2) фид через {engine}: HTTP {status}, элементов {n}, "
-                  f"время {dt:.1f}s, http={ver}")
-        except Exception as e:  # noqa: BLE001
-            results[engine] = f"ERR:{type(e).__name__}"
-            print(f"2) фид через {engine}: ОШИБКА {type(e).__name__}: {e}")
+    t0 = time.monotonic()
+    try:
+        from curl_cffi import requests as creq
+        r = creq.get(FEED, proxy=proxy, timeout=20, impersonate="chrome", headers=HEADERS)
+        n = len(items_of(json.loads(r.text))) if r.status_code == 200 else -1
+        out["feed"] = f"HTTP {r.status_code} n={n}"
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        out["feed"] = f"ERR {type(e).__name__}: {msg[:80]}"
+        return out
+    try:
+        import httpx
+        with httpx.Client(proxy=proxy, timeout=20.0, follow_redirects=True,
+                          http2=True, headers=HEADERS) as c:
+            rr = c.get(FEED)
+        out["feed_hx"] = f"HTTP {rr.status_code}"
+    except Exception as e:  # noqa: BLE001
+        out["feed_hx"] = f"ERR {type(e).__name__}"
+    out["sec"] = round(time.monotonic() - t0, 1)
+    return out
 
-    verdict = ok_cf and results.get("curl_cffi") == 200
-    print(f"\nВЕРДИКТ: {'ПРОКСИ ГОДЕН для HIRIFY_PROXY' if verdict else 'ПРОКСИ НЕ ГОДЕН'}")
-    return 0 if verdict else 1
+
+def main() -> int:
+    raw = (os.getenv("PROBE_CANDIDATES") or "").strip()
+    if not raw:
+        p = (os.getenv("HIRIFY_PROXY") or "").strip()
+        if not p:
+            print("!! нет ни PROBE_CANDIDATES, ни HIRIFY_PROXY")
+            return 1
+        raw = p
+    cands = [c.strip() for c in raw.split(",") if c.strip()]
+    print(f"Кандидатов: {len(cands)} (параллельно, по 5)")
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        res = list(pool.map(check, cands))
+
+    print("\n=== РЕЗУЛЬТАТЫ ===")
+    good = []
+    for r in res:
+        line = f"{mask(r['proxy']):<34} trace: {r['trace']} | feed: {r['feed']}"
+        if r.get("feed_hx"):
+            line += f" | hx: {r['feed_hx']}"
+        if r.get("sec") is not None:
+            line += f" [{r['sec']}s]"
+        print(line)
+        if r["feed"] and r["feed"].startswith("HTTP 200") and \
+           r.get("feed_hx") and r["feed_hx"].startswith("HTTP 200"):
+            good.append(r)
+
+    if good:
+        best = sorted(good, key=lambda x: x["sec"] or 999)[0]
+        print(f"\nBEST={best['proxy']}")
+        print("ВЕРДИКТ: есть годной прокси — поставь его в секрет HIRIFY_PROXY")
+        return 0
+    print("\nВЕРДИКТ: годных нет — нужны новые кандидаты")
+    return 1
 
 
 if __name__ == "__main__":
