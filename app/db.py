@@ -242,6 +242,8 @@ class Database:
                 + by_status.get("skipped_scam", 0)
                 + by_status.get("skipped_restricted", 0)
             ),
+            # «Слишком старые»: опубликованы раньше границы свежести — не присылались
+            "stale": by_status.get("skipped_stale", 0),
         }
 
     # ---------- подписчики ----------

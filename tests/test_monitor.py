@@ -3,6 +3,7 @@ import asyncio
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -897,4 +898,111 @@ def test_automation_last_flag_derived_from_legacy_db():
     # и heal НЕ сбросит счётчик (флаг «недавний»)
     mon._automation_healed([{"chat_id": 1}])
     assert mon._automation_flag_count == 2
+    db.close()
+
+
+# ------------------------------------------------------------------ свежесть
+
+
+def _iso(dt: datetime) -> str:
+    """created_at как отдаёт сайт: 2026-11-11T00:44:12.000000Z."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+
+def test_stale_vacancies_skipped_between_polls_boundary():
+    """Граница свежести = min(окно; прошлый проход − люфт):
+    древнее (дни) не присылаем, а опубликованное МЕЖДУ проходами — присылаем,
+    даже если оно старше жёсткого окна (ритм опроса не режет своё)."""
+    now = datetime.now(timezone.utc)
+    items = [
+        # опубликована 8 дней назад — ровно тот случай, что жаловался пользователь
+        {"id": 301, "slug": "301-ancient-role", "source": "telegram",
+         "created_at": _iso(now - timedelta(days=8))},
+        # опубликована 25 минут назад при прош-проходе 40 минут назад: между
+        # проходами → свежая, хоть и старше жёсткого окна в 20 минут
+        {"id": 302, "slug": "302-between-polls", "source": "telegram",
+         "created_at": _iso(now - timedelta(minutes=25))},
+    ]
+    api = {"302-between-polls": (vacancy_json("Between Polls Role", 302),
+                                contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.fresh_window_min = 20              # жёсткое окно меньше ритма опроса
+    mon._last_poll_ts = time.time() - 40 * 60  # прошлый проход 40 минут назад
+    spy = FakeClient(items, api)
+    mon.client = spy
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 1               # древнюю не открывали вовсе
+    assert db.job_status(301) == "skipped_stale"
+    assert db.job_status(302) == "sent"       # межпроходная — доставлена
+    assert stats["stale"] == 1 and stats["sent"] == 1
+    db.close()
+
+
+def test_cold_start_first_poll_keeps_hard_window():
+    """Холодный старт (прошлого прохода нет) — только жёсткое окно:
+    первый запуск не вываливает всю первую страницу как «новую»."""
+    now = datetime.now(timezone.utc)
+    items = [
+        {"id": 303, "slug": "303-hour-old", "source": "telegram",
+         "created_at": _iso(now - timedelta(hours=2))},
+        {"id": 304, "slug": "304-just-posted", "source": "telegram",
+         "created_at": _iso(now - timedelta(minutes=5))},
+    ]
+    api = {"304-just-posted": (vacancy_json("Just Posted Role", 304),
+                              contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.fresh_window_min = 30
+    mon._last_poll_ts = 0.0                   # прошлого прохода нет
+    spy = FakeClient(items, api)
+    mon.client = spy
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert db.job_status(303) == "skipped_stale"
+    assert db.job_status(304) == "sent"
+    assert stats["stale"] == 1
+    db.close()
+
+
+def test_fresh_window_disabled_sends_old_too():
+    """FRESH_WINDOW_MIN=0 — прежнее поведение: старьё тоже уходит."""
+    now = datetime.now(timezone.utc)
+    items = [{"id": 305, "slug": "305-week-old", "source": "telegram",
+              "created_at": _iso(now - timedelta(days=7))}]
+    api = {"305-week-old": (vacancy_json("Week Old Role", 305), contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.fresh_window_min = 0
+    spy = FakeClient(items, api)
+    mon.client = spy
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert db.job_status(305) == "sent"
+    assert stats.get("stale", 0) == 0
+    db.close()
+
+
+def test_feed_item_without_created_at_still_processed():
+    """Нет created_at в элементе фида — свежесть не судим (fail-open)."""
+    items = [{"id": 306, "slug": "306-no-date", "source": "telegram"}]
+    api = {"306-no-date": (vacancy_json("No Date Role", 306), contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.fresh_window_min = 30
+    spy = FakeClient(items, api)
+    mon.client = spy
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert db.job_status(306) == "sent" and stats["stale"] == 0
+    db.close()
+
+
+def test_last_poll_ts_persists_across_monitor_restarts():
+    """Момент прошлого прохода живёт в БД: новый ран эстафеты продолжает
+    отсчёт свежести с того же места, а не с холодного старта."""
+    mon, _, _, db = make_monitor()
+    asyncio.run(mon.poll_once(source="test"))
+    ts = float(db.get_setting("last_poll_ts", "0"))
+    assert ts > 0
+    # «перезапуск»: новый Monitor на той же БД подхватывает метку
+    mon2 = Monitor(mon.client, db, mon.sender, mon.cfg)
+    assert mon2._last_poll_ts == ts
     db.close()

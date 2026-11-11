@@ -257,6 +257,10 @@ async def cmd_fresh(message: Message, command: CommandObject, services: Services
             f"\nℹ️ Ещё {stats['no_audience']} обработал, но подписчиков этих разделов "
             "не нашлось — проверьте ⚙️ /settings."
         )
+    if stats.get("stale"):
+        extra += (
+            f"\n🕰 Ещё {stats['stale']} вакансий опубликованы слишком давно — не присылал."
+        )
     if stats["total"] == 0:
         await message.answer(texts.FRESH_EMPTY)
     else:
@@ -275,7 +279,7 @@ async def cmd_stats(message: Message, services: Services):
     await message.answer(
         texts.STATS_TMPL.format(**{k: s.get(k, 0) for k in
                                    ("total", "sent", "sent_today", "skipped", "filtered",
-                                    "failed", "fetch_failed", "send_failed")}),
+                                    "stale", "failed", "fetch_failed", "send_failed")}),
         parse_mode="HTML",
     )
 

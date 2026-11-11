@@ -5,6 +5,7 @@ import asyncio
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from .db import Database
@@ -32,6 +33,11 @@ AUTOMATION_BACKOFF_MIN = (90, 240, 480, 960, 1440)   # мин, с эскалац
 # счётчик эскалации НЕ сбрасывается «излечением» (сайт снял флаг ≠ урок
 # усвоен). Полный сброс — только если флагов не было 48 ч подряд.
 AUTOMATION_FLAG_MEMORY_SEC = 48 * 3600
+# Люфт границы свежести вакансий, сек: сайт индексирует публикации в «newest»
+# не мгновенно, да и ритм опроса плавает (джиттер ×0.8–1.35). Публикация
+# МЕЖДУ проходами должна доставляться, даже если ей уже чуть больше
+# «жёсткого» окна FRESH_WINDOW_MIN.
+FEED_FRESH_SLACK_SEC = 600
 # Пока сайт держит флаг, фиды тоже не дёргаем каждые 5 мин: раз в 30 мин
 # хватит (бэклог копится и так), зато ограниченный аккаунт не палится
 # непрерывным поллингом — возможно, каждая попытка продлевает ограничение.
@@ -62,7 +68,9 @@ class Monitor:
         self.sender = sender
         self._last_cookie_warn = 0.0
         self._last_automation_warn = 0.0
-        self._last_poll_ts = 0.0
+        # прошлый проход фида — из БД (переживает эстафету ранов): от него
+        # считается граница свежести вакансий
+        self._last_poll_ts = self._load_ts("last_poll_ts")
         # пауза после флага автоматизации — из БД (переживает замещение ранов)
         self._automation_until = self._load_ts("automation_until")
         self._automation_flag_count = int(self._load_ts("automation_flags"))
@@ -219,8 +227,8 @@ class Monitor:
     def _new_stats() -> dict:
         return {
             "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
-            "fetch_failed": 0, "send_failed": 0, "no_audience": 0, "cookie_warn": False,
-            "automation_pause": False, "quota_deferred": 0,
+            "stale": 0, "fetch_failed": 0, "send_failed": 0, "no_audience": 0,
+            "cookie_warn": False, "automation_pause": False, "quota_deferred": 0,
         }
 
     @staticmethod
@@ -255,6 +263,8 @@ class Monitor:
         finally:
             self._busy = False
             self._last_poll_ts = time.time()
+            # в БД: следующий ран эстафеты продолжит отсчёт свежести с того же места
+            self.db.set_setting("last_poll_ts", str(int(self._last_poll_ts)))
             # «сняли флаг»-сообщение — только про СВЕЖЕИСТЕКШУЮ паузу, один раз
             self._pause_just_expired = False
 
@@ -325,6 +335,33 @@ class Monitor:
             unique.append(row)
         known = self.db.known_job_ids([job_id for job_id, _, _, _, _ in unique])
         fresh = [row for row in unique if row[0] not in known]
+
+        # 2.5) СВЕЖЕСТЬ: «новая для бота» ≠ «недавно опубликованная». Фид с
+        # only_direct_contact обновляется редко: на странице 1 висят вакансии
+        # возрастом часы и дни (бэклог за паузы, «утренняя метла», переоткрытия),
+        # и если job_id мы раньше не видели — подписчику ушла бы карточка
+        # «опубликовано 03.11». Интересно только опубликованное недавно:
+        # всё старше границы свежести помечаем skipped_stale БЕЗ открытия
+        # вакансии (просмотры аккаунта не тратим) и навсегда — ретраить
+        # старьё незачем.
+        if self.cfg.fresh_window_min > 0:
+            threshold = self._fresh_threshold_ts()
+            kept: list[tuple[int, str, str, object, dict]] = []
+            for row in fresh:
+                if self._is_stale(row[4], threshold):
+                    self.db.add_job(row[0], row[1], row[2])
+                    self.db.mark_job(row[0], "skipped_stale")
+                    stats["stale"] += 1
+                else:
+                    kept.append(row)
+            if stats["stale"]:
+                log.info(
+                    "Свежесть: %d вакансий опубликованы раньше границы %s — пропущены",
+                    stats["stale"],
+                    datetime.fromtimestamp(threshold, tz=timezone.utc).strftime("%d.%m %H:%M UTC"),
+                )
+            fresh = kept
+
         if not fresh:
             log.debug("Новых вакансий нет")
             return stats
@@ -490,6 +527,40 @@ class Monitor:
         return stats
 
     # ---------------------------------------------------------------- helpers
+
+    def _fresh_threshold_ts(self) -> float:
+        """Самая ранняя допустимая дата публикации «свежей» вакансии.
+
+        Свежесть = «опубликовано не старше FRESH_WINDOW_MIN от сейчас» И
+        «опубликовано после прошлого прохода фида (минус люфт)». Второе
+        покрывает публикации МЕЖДУ проходами: ритм опроса плавает (джиттер,
+        ночное замедление ×3), и жёсткое окно в одиночку отрезало бы своё же —
+        при POLL_MINUTES=30 публикация возрастом 35 мин обязана уйти.
+        Холодный старт (прошлого прохода нет) — только жёсткое окно:
+        первый запуск не должен вываливать всю первую страницу как «новую».
+        """
+        threshold = time.time() - self.cfg.fresh_window_min * 60
+        since_poll = self._last_poll_ts - FEED_FRESH_SLACK_SEC
+        if self._last_poll_ts > 0 and since_poll < threshold:
+            threshold = since_poll
+        return threshold
+
+    def _is_stale(self, item: dict, threshold_ts: float) -> bool:
+        """Опубликовано ли раньше границы свежести (created_at элемента фида, UTC).
+
+        Нет created_at или формат не разобран — не считаем старьём:
+        отсутствие поля у сайта не должно останавливать рассылку (fail-open).
+        """
+        raw = str(item.get("created_at") or "").strip()
+        if not raw:
+            return False
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp() <= threshold_ts
 
     def _prefilter_reason(self, item: dict, feed) -> Optional[str]:
         """Дешёвый отбор ПО ЭЛЕМЕНТУ ФИДА, без открытия вакансии.
