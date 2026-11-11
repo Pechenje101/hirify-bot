@@ -61,7 +61,11 @@ jobs:
         run: python main.py
 
       - name: Сохранить состояние (SQLite) в репозиторий
-        if: ${{ !cancelled() }}
+        # ВАЖНО: always(), а НЕ !cancelled() — cancelled() истинно именно
+        # при отмене рана, и !cancelled() тогда ПРОПУСКАЕТ шаг. С always()
+        # БД коммитится и при отмене (иначе настройки подписчиков — вид
+        # карточек, разделы, /start — терялись бы на каждом рестарте).
+        if: ${{ always() }}
         run: |
           git config user.name "hirify-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -80,7 +84,9 @@ jobs:
           fi
 
       - name: "Эстафета: перезапустить бота"
-        if: ${{ !cancelled() }}
+        # тоже always(): после отмены (например, замена кода через очередь)
+        # бот должен продолжить жить, а не ждать страховочный cron
+        if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
