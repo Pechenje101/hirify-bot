@@ -48,13 +48,23 @@ async def main() -> int:
     try:
         for name in names:
             try:
-                posts = await client.fetch_posts(name)
+                html, status, final_url = await client.fetch_page(name)
             except Exception as e:  # noqa: BLE001
                 print(f"\n[{name}] ❌ ОШИБКА ЗАГРУЗКИ: {type(e).__name__}: {str(e)[:140]}")
                 failures += 1
                 continue
+            posts = parse_channel_html(html)
             detected = sum(1 for p in posts if looks_like_vacancy(p["text"]))
-            print(f"\n[{name}] постов прочитано: {len(posts)}; похоже на вакансии: {detected}")
+            print(f"\n[{name}] HTTP {status}, {len(html)} байт HTML, финальный URL: {final_url}")
+            print(f"  вхождений разметки: wrap={html.count('tgme_widget_message_wrap')} "
+                  f"text_div={html.count('tgme_widget_message_text')} "
+                  f"data-post={html.count('data-post=')}")
+            print(f"  постов прочитано: {len(posts)}; похоже на вакансии: {detected}")
+            if not posts:
+                # сниппет начала body — видно, что реально вернул сервер
+                import re as _re
+                body = _re.sub(r"\s+", " ", html[:600])
+                print(f"  сниппет: {body[:400]}")
             for tag, p in (("свежий", posts[0] if posts else None),
                            ("последний", posts[-1] if posts else None)):
                 if not p:
@@ -65,7 +75,7 @@ async def main() -> int:
             await asyncio.sleep(1.5)
     finally:
         await client.close()
-    print("\nИТОГ:", "все каналы читаются" if not failures else f"проблемных каналов: {failures}")
+    print("\nИТОГ:", "все каналы читаются и разбираются" if not failures else f"проблемных каналов: {failures}")
     return 1 if failures else 0
 
 

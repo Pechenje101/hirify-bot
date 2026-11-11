@@ -177,18 +177,24 @@ class ChannelClient:
             await self._httpx.aclose()
             self._httpx = None
 
-    async def _get(self, url: str) -> str:
+    async def fetch_page(self, name: str) -> tuple[str, int, str]:
+        """(html, HTTP-статус, финальный URL) страницы веб-превью канала.
+
+        Диагностика редиректов: t.me/s/<имя> непубличного канала уводит на
+        заглушку t.me/<имя> («канал не существует»).
+        """
+        await self.open()
+        url = _CHANNEL_PAGE_URL.format(name=name)
         if self._curl is not None:
             r = await self._curl.get(url, headers={"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"})
-            return r.text
+            return r.text, r.status_code, str(r.url)
         assert self._httpx is not None
         r = await self._httpx.get(url)
-        return r.text
+        return r.text, r.status_code, str(r.url)
 
     async def fetch_posts(self, name: str) -> list[dict]:
         """Последние посты публичного канала (одна страница веб-превью)."""
-        await self.open()
-        html = await self._get(_CHANNEL_PAGE_URL.format(name=name))
+        html, _status, _url = await self.fetch_page(name)
         posts = parse_channel_html(html)
         if not posts:
             hint = ""
