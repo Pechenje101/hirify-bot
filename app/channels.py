@@ -63,6 +63,10 @@ class _PostExtractor(HTMLParser):
     Пост «закрыт» началом следующего (посты — сиблинги), а не </div>:
     внутри wrap вложенные div'ы, точный трекинг глубины лишний.
 
+    Реальная разметка t.me/s (сверено живой пробой с Actions): id поста —
+    data-post на ВНУТРЕННЕМ div (tgme_widget_message), а НЕ на wrap —
+    там его нет; поэтому id берём с первого data-post внутри открытого поста.
+
     Особенности разметки, которые учитываем: <br/> → \\n, <img alt="🔥"> →
     эмодзи из alt, <a>текст</a> → текст (юserнеймы Telegram сам оборачивает
     ссылкой — текст и есть @упоминание), сущности (&amp;…) — convert_charrefs.
@@ -76,19 +80,32 @@ class _PostExtractor(HTMLParser):
         self._parts: list[str] = []
         self._capture = False
         self._in_anchor = False
+        self._post_open = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
         a = {k: (v or "") for k, v in attrs}
         cls = a.get("class") or ""
         if tag == "div" and "tgme_widget_message_wrap" in cls:
             self._flush()
-            post = (a.get("data-post") or "").partition("/")[2]
-            self._id = int(post) if post.isdigit() else None
+            self._id = None
             self._dt = ""
             self._parts = []
-        elif tag == "time" and self._id is not None and not self._dt:
+            self._post_open = True
+            # старая структура держала data-post прямо на wrap — берём и его
+            dp = a.get("data-post") or ""
+            if dp:
+                mid = dp.partition("/")[2]
+                self._id = int(mid) if mid.isdigit() else None
+            return
+        if not self._post_open:
+            return
+        data_post = a.get("data-post") or ""
+        if tag == "div" and data_post and self._id is None:
+            mid = data_post.partition("/")[2]
+            self._id = int(mid) if mid.isdigit() else None
+        elif tag == "time" and not self._dt:
             self._dt = a.get("datetime") or ""
-        elif tag == "div" and "tgme_widget_message_text" in cls and self._id is not None:
+        elif tag == "div" and "tgme_widget_message_text" in cls:
             self._capture = True
         if self._capture:
             if tag == "br":
@@ -117,6 +134,7 @@ class _PostExtractor(HTMLParser):
         if text:
             self.posts.append({"id": self._id, "created_at": self._dt, "text": text})
         self._id = None
+        self._post_open = False
 
     def close(self) -> None:  # последний пост не имеет «следующего»
         self._flush()

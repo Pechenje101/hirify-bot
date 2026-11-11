@@ -13,12 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.channels import channel_job_id, parse_channel_html  # noqa: E402
 from app.config import parse_tg_channels  # noqa: E402
 
-# --- фрагмент страницы t.me/s/<name> (структура как у реального веб-превью) ----
+# --- фрагмент страницы t.me/s/<name> (структура как у реального веб-превью:
+# id поста — data-post на ВНУТРЕННЕМ div, НЕ на wrap — сверено живой пробой) ---
 PAGE = """
 <html><body>
 <div class="tgme_container">
- <div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="cpa_people/1234">
-  <div class="tgme_widget_message js-widget_message text_force_block_render">
+ <div class="tgme_widget_message_wrap js-widget_message_wrap" data-view="abcd">
+  <div class="tgme_widget_message js-widget_message text_force_block_render" data-post="cpa_people/1234">
    <div class="tgme_widget_message_bubble">
     <div class="tgme_widget_message_text js-message_text" dir="auto">
       Senior Media Buyer (iGaming)<br/>
@@ -33,21 +34,25 @@ PAGE = """
    </div>
   </div>
  </div>
- <div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="cpa_people/1235">
-  <div class="tgme_widget_message_bubble">
-   <div class="tgme_widget_message_text js-message_text" dir="auto">
+ <div class="tgme_widget_message_wrap js-widget_message_wrap" data-view="efgh">
+  <div class="tgme_widget_message js-widget_message" data-post="cpa_people/1235">
+   <div class="tgme_widget_message_bubble">
+    <div class="tgme_widget_message_text js-message_text" dir="auto">
      Новости рынка: ставки выросли, подробности
      <a href="https://example.com">на сайте</a>
+    </div>
+    <time datetime="2026-11-11T10:00:00+00:00">10:00</time>
    </div>
-   <time datetime="2026-11-11T10:00:00+00:00">10:00</time>
   </div>
  </div>
- <div class="tgme_widget_message_wrap js-widget_message_wrap" data-post="cpa_people/1236">
-  <div class="tgme_widget_message_bubble">
+ <div class="tgme_widget_message_wrap js-widget_message_wrap" data-view="ijkl">
+  <div class="tgme_widget_message js-widget_message" data-post="cpa_people/1236">
+   <div class="tgme_widget_message_bubble">
    <div class="tgme_widget_message_photo_wrap"></div>
    <!-- пост без текста (фото/видео без подписи) — пропускаем -->
   </div>
  </div>
+</div>
 </div>
 </body></html>
 """
@@ -80,6 +85,12 @@ def test_parse_channel_html_degenerate_inputs():
     assert parse_channel_html("мусор ∉ html") == []
     # битый html не роняет разбор (HTMLParser терпим к мусору)
     assert parse_channel_html("<div class='tgme_widget_message_wrap' data-post='a/x'>") == []
+    # data-post НА WRAP (старая структура) тоже не ломается: id берётся с любого div
+    legacy = ('<div class="tgme_widget_message_wrap" data-post="ch/42">'
+              '<div class="tgme_widget_message_text">пост</div>'
+              '<time datetime="2026-11-11T09:00:00+00:00">09:00</time></div>')
+    posts = parse_channel_html(legacy)
+    assert posts == [{"id": 42, "created_at": "2026-11-11T09:00:00+00:00", "text": "пост"}]
 
 
 def test_channel_job_id_is_negative_deterministic_and_separated():
