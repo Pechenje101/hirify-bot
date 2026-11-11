@@ -1,0 +1,26 @@
+name: probe-channels
+
+# Живая проба источников-ТГ-каналов (t.me/s/<имя>, анонимно): читается ли
+# веб-превью, сколько постов разбирается, сколько похоже на вакансии.
+# Бота не перезапускает (не входит в paths-фильтр bot.yml).
+on:
+  workflow_dispatch:
+
+jobs:
+  channels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt h2 curl_cffi
+
+      - name: Проба ТГ-каналов (t.me/s, анонимно)
+        env:
+          TG_CHANNELS: 'cpa_people,opento_igaming,payments_lenkep,IT_iGaming'
+        run: python tools/probe_channels.py

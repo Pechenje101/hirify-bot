@@ -119,6 +119,7 @@ async def run() -> None:
         except asyncio.CancelledError:
             pass
         await client.close()
+        await monitor.aclose()  # сессия ТГ-каналов
         db.close()
         await bot.session.close()
 

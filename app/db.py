@@ -241,6 +241,7 @@ class Database:
                 + by_status.get("skipped_off_industry", 0)
                 + by_status.get("skipped_scam", 0)
                 + by_status.get("skipped_restricted", 0)
+                + by_status.get("skipped_not_vacancy", 0)  # посты ТГ-каналов не про вакансии
             ),
             # «Слишком старые»: опубликованы раньше границы свежести — не присылались
             "stale": by_status.get("skipped_stale", 0),

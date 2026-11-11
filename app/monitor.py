@@ -9,12 +9,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .db import Database
+from .channels import ChannelClient, channel_job_id
 from .hirify import (
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
     HirifyNotFound, HirifyRestrictedError,
 )
 from .parsing import CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, vacancy_from_api
 from .sender import VacancySender
+from .textparse import looks_like_vacancy, parse_vacancy_text
 
 log = logging.getLogger("hirify.monitor")
 
@@ -94,6 +96,8 @@ class Monitor:
         self._busy = False
         self._wake = asyncio.Event()
         self._bg_tasks: set[asyncio.Task] = set()  # сильные ссылки на fire-and-forget задачи
+        # анонимный читатель ТГ-каналов (t.me/s/…) — лениво, если каналы заданы
+        self._channels: ChannelClient | None = None
 
     @property
     def busy(self) -> bool:
@@ -223,6 +227,12 @@ class Monitor:
         self._running = False
         self._wake.set()  # разбудить сон, чтобы цикл завершился сразу
 
+    async def aclose(self) -> None:
+        """Закрыть сессию каналов (вызывает main при остановке бота)."""
+        if self._channels is not None:
+            await self._channels.close()
+            self._channels = None
+
     @staticmethod
     def _new_stats() -> dict:
         return {
@@ -290,11 +300,29 @@ class Monitor:
             self.db.set_setting("deep_sweep_date", self._today_msk())
             log.info("Утренний проход после ночи — фид «метлой»: %d стр. на раздел", pages)
 
-        # 1) фид каждого раздела — из JSON-API АНОНИМНО (cookie не тратим:
-        #    круглосуточный поллинг не должен накрывать аккаунт): только
-        #    вакансии с прямыми TG-контактами, серверная фильтрация
+        # 1) источники: фид каждого раздела hirify — из JSON-API АНОНИМНО
+        #    (cookie не тратим: круглосуточный поллинг не должен накрывать
+        #    аккаунт): только вакансии с прямыми TG-контактами, серверная
+        #    фильтрация; ТГ-каналы — анонимное веб-превью t.me/s/<имя>
+        #    (одна страница последних постов; «метла» глубины каналов не
+        #    касается: свежесть постов ограничена окном FRESH_WINDOW_MIN)
         links: list[tuple[int, str, str, object, dict]] = []  # (job_id, slug, url, feed, item)
         for feed in self.cfg.feeds:
+            if getattr(feed, "source", "hirify") == "tg":
+                posts = await self._fetch_channel_posts(feed)
+                for it in posts:
+                    mid = int(it.get("id") or 0)
+                    if not mid:
+                        continue
+                    name = feed.channel or feed.key
+                    links.append((
+                        channel_job_id(name, mid),
+                        f"{feed.key}-{mid}",
+                        f"https://t.me/{name}/{mid}",
+                        feed, it,
+                    ))
+                await asyncio.sleep(self.cfg.fetch_delay_sec)  # вежливость между каналами
+                continue
             for page in range(1, max(1, pages) + 1):
                 try:
                     items = await self.client.fetch_feed_api(feed, page)
@@ -372,20 +400,31 @@ class Monitor:
             log.debug("Подписчиков нет — новые вакансии пропускаю (вернутся как ретрай)")
             return stats
 
-        # после флага «автоматизация» даём сайту остыть: фиды смотрим (это
-        # дёшево и не карается), но вакансии не трогаем до конца паузы
-        if time.time() < self._automation_until:
-            log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии подождут",
+        # после флага «автоматизация» даём САЙТУ hirify остыть: его фиды
+        # смотрим (дёшево и не карается), но вакансии не трогаем до конца
+        # паузы. ТГ-каналы под флаг hirify не попадают — их обрабатываем.
+        tg_rows = [row for row in fresh if getattr(row[3], "source", "hirify") == "tg"]
+        hy_rows = [row for row in fresh if getattr(row[3], "source", "hirify") != "tg"]
+        if time.time() < self._automation_until and hy_rows:
+            log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии hirify подождут, каналы работают",
                      self.automation_left_sec / 60)
             stats["automation_pause"] = True
-            return stats
+            hy_rows = []
 
-        # 3) открываем каждую страницу вакансии, ищем контакты
-        fresh = fresh[:max_jobs]
-        log.info("[%s] новых вакансий: %d (лимит %d, разделы: %s)", source, len(fresh), max_jobs,
+        # 3) открываем каждую страницу вакансии, ищем контакты.
+        #    Лимит открытия — только на вакансии hirify (просмотры аккаунта
+        #    не бесплатны); посты каналов бесплатны и их немного за окно
+        fresh = tg_rows + hy_rows[:max_jobs]
+        log.info("[%s] новых вакансий: %d (лимит %d, источники: %s)", source, len(fresh), max_jobs,
                  ", ".join(f.key for f in self.cfg.feeds))
 
         for job_id, slug, url, feed, item in fresh:
+            # пост ТГ-канала: отдельный конвейер (детектор вакансии →
+            # parse_vacancy_text → карточки), hirify-API не трогаем вовсе
+            if getattr(feed, "source", "hirify") == "tg":
+                await self._process_channel_post(job_id, slug, url, feed, item, stats, subscribers)
+                continue
+
             # квота запросов от имени аккаунта: сайт считает просмотры,
             # и именно пачки подряд — «автоматизация». Остальные вакансии
             # НЕ теряются: остаются невидимыми → следующий проход доберёт
@@ -496,35 +535,104 @@ class Monitor:
 
             # считаем доставки — если НЕ УДАЛОСЬ НИ ОДНОЙ, вакансия
             # не финализируется (send_failed) и уйдёт ретраем в следующем проходе
-            delivered = 0
-            for s in recipients:
-                try:
-                    await self.sender.send_vacancy(
-                        s["chat_id"], v,
-                        silent=s["silent"],
-                        display=s.get("display", "auto"),
-                    )
-                    delivered += 1
-                except Exception as e:  # noqa: BLE001
-                    log.error("Не отправилось сообщение в чат %s: %s", s["chat_id"], e)
-            if delivered:
-                self.db.mark_job(job_id, "sent")
-                stats["sent"] += 1
-            else:
-                attempts = self.db.bump_job_attempts(job_id)
-                if attempts >= MAX_SEND_ATTEMPTS:
-                    self.db.mark_job(job_id, "failed")
-                    stats["failed"] += 1
-                    log.warning(
-                        "job %d: доставка не удалась %d раз — снимаю с ретрая (failed)",
-                        job_id, attempts,
-                    )
-                else:
-                    self.db.mark_job(job_id, "send_failed")
-                    stats["send_failed"] += 1
-                    log.warning("job %d: ни одна отправка не прошла — повторю в следующем проходе", job_id)
+            await self._deliver_vacancy(job_id, v, recipients, stats)
 
         return stats
+
+    async def _process_channel_post(
+        self, job_id: int, slug: str, url: str, feed, item: dict, stats: dict, subscribers: list[dict],
+    ) -> None:
+        """Пост ТГ-канала → детектор вакансии → карточка → рассылка.
+
+        Тот же конвейер, что для текста от юзера (/card и автокарточки):
+        looks_like_vacancy отсекает болтовню/новости канала, parse_vacancy_text
+        собирает Vacancy (зарплата/грейд/навыки/контакты прямо из текста),
+        дальше — общие фильтры (индустрия) и общая доставка карточек.
+        hirify-API НЕ задействован: ни просмотров аккаунта, ни квот.
+        """
+        self.db.add_job(job_id, slug, url)
+        stats["total"] += 1
+        text = str(item.get("text") or "").strip()
+        if not looks_like_vacancy(text):
+            self.db.mark_job(job_id, "skipped_not_vacancy")
+            stats["filtered"] += 1
+            log.debug("post %d: не похоже на вакансию — пропускаю", job_id)
+            return
+
+        v = parse_vacancy_text(
+            text,
+            date_posted=str(item.get("created_at") or "")[:10],
+            feed_key=feed.key, feed_label=feed.label,
+        )
+        self.db.update_job_parsed(
+            job_id, title=v.title, company=v.company, salary=v.salary,
+            tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
+        )
+
+        # тот же индустриальный фильтр, что для вакансий hirify
+        if self.cfg.industry_strict and not v.is_target_industry:
+            self.db.mark_job(job_id, "skipped_off_industry")
+            stats["filtered"] += 1
+            log.debug("post %d: целевых индустрий нет — пропускаю", job_id)
+            return
+        if not v.has_direct_contact:
+            self.db.mark_job(job_id, "skipped_no_contact")
+            stats["skipped"] += 1
+            log.debug("post %d: TG-контакта в тексте нет — пропускаю", job_id)
+            return
+
+        recipients = self._recipients_for(v, subscribers)
+        if not recipients:
+            self.db.mark_job(job_id, "sent")
+            stats["no_audience"] += 1
+            log.debug("post %d: подписчиков раздела «%s» нет — обработан без доставки",
+                      job_id, v.feed_key)
+            return
+        await self._deliver_vacancy(job_id, v, recipients, stats)
+
+    async def _deliver_vacancy(self, job_id: int, v, recipients: list[dict], stats: dict) -> None:
+        """Доставка карточки по адресатам + финализация статуса
+        (общее для вакансий hirify и постов ТГ-каналов)."""
+        delivered = 0
+        for s in recipients:
+            try:
+                await self.sender.send_vacancy(
+                    s["chat_id"], v,
+                    silent=s["silent"],
+                    display=s.get("display", "auto"),
+                )
+                delivered += 1
+            except Exception as e:  # noqa: BLE001
+                log.error("Не отправилось сообщение в чат %s: %s", s["chat_id"], e)
+        if delivered:
+            self.db.mark_job(job_id, "sent")
+            stats["sent"] += 1
+        else:
+            attempts = self.db.bump_job_attempts(job_id)
+            if attempts >= MAX_SEND_ATTEMPTS:
+                self.db.mark_job(job_id, "failed")
+                stats["failed"] += 1
+                log.warning(
+                    "job %d: доставка не удалась %d раз — снимаю с ретрая (failed)",
+                    job_id, attempts,
+                )
+            else:
+                self.db.mark_job(job_id, "send_failed")
+                stats["send_failed"] += 1
+                log.warning("job %d: ни одна отправка не прошла — повторю в следующем проходе", job_id)
+
+    async def _fetch_channel_posts(self, feed) -> list[dict]:
+        """Последние посты канала через анонимное веб-превью t.me/s/<имя>.
+
+        Сбой канала не роняет проход: лог и [] — другие источники работают.
+        """
+        if self._channels is None:
+            self._channels = ChannelClient(self.cfg)
+        try:
+            return await self._channels.fetch_posts(feed.channel or feed.key)
+        except Exception as e:  # noqa: BLE001
+            log.error("Не удалось загрузить канал «%s»: %s", feed.key, e)
+            return []
 
     # ---------------------------------------------------------------- helpers
 

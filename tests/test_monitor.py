@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import Config  # noqa: E402
+from app.channels import channel_job_id  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
 from app.parsing import Vacancy  # noqa: E402
@@ -107,6 +108,7 @@ class FakeSender:
 def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient, FakeSender, Database]:
     cfg = Config(bot_token="x")
     cfg.hirify_feeds = monkeypatch_feeds
+    cfg.tg_channels = ""  # в базовых тестах каналов нет — сеть не трогаем
     cfg.remote_strict = False
     cfg.crypto_strict = False
     cfg.industry_strict = False  # по умолчанию включён; в базовых тестах выключен
@@ -1005,4 +1007,131 @@ def test_last_poll_ts_persists_across_monitor_restarts():
     # «перезапуск»: новый Monitor на той же БД подхватывает метку
     mon2 = Monitor(mon.client, db, mon.sender, mon.cfg)
     assert mon2._last_poll_ts == ts
+    db.close()
+
+
+# ------------------------------------------------------------- ТГ-каналы-источники
+
+class FakeChannelClient:
+    """Вместо ChannelClient: посты-заготовки без сети."""
+
+    def __init__(self, posts_by_channel: dict[str, list[dict]]):
+        self.posts_by_channel = posts_by_channel
+        self.fetches = 0
+
+    async def fetch_posts(self, name: str) -> list[dict]:
+        self.fetches += 1
+        return self.posts_by_channel.get(name, [])
+
+    async def close(self) -> None:
+        pass
+
+
+VACANCY_POST = (
+    "Senior Media Buyer (iGaming)\n"
+    "Ставка: 3-5k$, казино-траф, betting-офферы, Facebook Ads.\n"
+    "Опыт от 2 лет, работа удалённая.\n"
+    "Резюме: @hr_igaming"
+)
+NEWS_POST = "Новости рынка: ставки выросли, подробности на сайте."
+SEEKER_POST = "Ищу работу медиабайером, резюме в личке, рассмотрю вакансии."
+
+
+def _ch_item(mid: int, text: str, created_at: str) -> dict:
+    return {"id": mid, "created_at": created_at, "text": text}
+
+
+def _make_channel_monitor(posts: dict[str, list[dict]]):
+    mon, client, sender, db = make_monitor()
+    mon.cfg.tg_channels = "cpa_people"
+    client.feed_items = []      # изолируем: только канал, без вакансий hirify
+    mon._channels = FakeChannelClient(posts)
+    return mon, client, sender, db
+
+
+def test_channel_post_detected_sent_and_deduped():
+    now = datetime.now(timezone.utc)
+    posts = {"cpa_people": [_ch_item(1234, VACANCY_POST, _iso(now - timedelta(minutes=5)))]}
+    mon, _, sender, db = _make_channel_monitor(posts)
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["total"] == 1 and stats["sent"] == 1
+    assert sender.sent and sender.sent[0][1].startswith("Senior Media Buyer")
+    # job_id поста — отрицательный (не пересекается с hirify)
+    assert db.job_status(channel_job_id("cpa_people", 1234)) == "sent"
+    # второй проход — дедуп, повторной отправки нет
+    sender.sent.clear()
+    stats2 = asyncio.run(mon.poll_once(source="test"))
+    assert stats2["total"] == 0 and sender.sent == []
+    db.close()
+
+
+def test_channel_news_and_seekers_skipped():
+    now = datetime.now(timezone.utc)
+    posts = {"cpa_people": [
+        _ch_item(1301, NEWS_POST, _iso(now - timedelta(minutes=4))),
+        _ch_item(1302, SEEKER_POST, _iso(now - timedelta(minutes=3))),
+    ]}
+    mon, _, sender, db = _make_channel_monitor(posts)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["total"] == 2 and stats["sent"] == 0
+    assert db.job_status(channel_job_id("cpa_people", 1301)) == "skipped_not_vacancy"
+    assert db.job_status(channel_job_id("cpa_people", 1302)) == "skipped_not_vacancy"
+    assert sender.sent == []
+    db.close()
+
+
+def test_channel_stale_post_not_sent():
+    now = datetime.now(timezone.utc)
+    posts = {"cpa_people": [_ch_item(1234, VACANCY_POST, _iso(now - timedelta(days=3)))]}
+    mon, _, sender, db = _make_channel_monitor(posts)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats.get("stale", 0) == 1 and stats["sent"] == 0 and sender.sent == []
+    assert db.job_status(channel_job_id("cpa_people", 1234)) == "skipped_stale"
+    db.close()
+
+
+def test_channels_work_during_hirify_automation_pause():
+    """Флаг автоматизации касается только hirify: каналы продолжают доставку."""
+    now = datetime.now(timezone.utc)
+    posts = {"cpa_people": [_ch_item(1234, VACANCY_POST, _iso(now - timedelta(minutes=5)))]}
+    mon, client, sender, db = _make_channel_monitor(posts)
+    # вакансия hirify тоже «новая» — есть что отложить паузой (иначе флаг не виден)
+    client.feed_items = FEED_ITEMS
+    mon._automation_until = time.time() + 3600
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["automation_pause"] is True   # вакансии hirify отложены
+    assert stats["sent"] == 1                  # а пост канала доставлен
+    assert sender.sent and sender.sent[0][1].startswith("Senior Media Buyer")
+    # вакансии hirify НЕ открыты вовсе (не потрачены ни просмотры, ни квоты)
+    assert client.job_fetches == 0
+    db.close()
+
+
+def test_channel_industry_filter_applies():
+    now = datetime.now(timezone.utc)
+    text = (
+        "Оператор теплицы (агрокомплекс)\n"
+        "Зарплата 40 000 ₽/мес, опыт от 1 года.\n"
+        "Резюме: @agro_hr, работа на месте."
+    )
+    posts = {"cpa_people": [_ch_item(1401, text, _iso(now - timedelta(minutes=5)))]}
+    mon, _, _, db = _make_channel_monitor(posts)
+    mon.cfg.industry_strict = True   # боевое значение
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["filtered"] == 1 and stats["sent"] == 0
+    assert db.job_status(channel_job_id("cpa_people", 1401)) == "skipped_off_industry"
+    db.close()
+
+
+def test_channel_recipient_feed_selection():
+    """Пост канала уходит только подписчикам, включившим этот канал в /settings."""
+    now = datetime.now(timezone.utc)
+    posts = {"cpa_people": [_ch_item(1234, VACANCY_POST, _iso(now - timedelta(minutes=5)))]}
+    mon, _, sender, db = _make_channel_monitor(posts)
+    # единственный подписчик выбрал только раздел hirify — канал выключен
+    mon.db.update_subscriber_settings(1, feeds=["remote"], silent=False)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["no_audience"] == 1 and sender.sent == []
+    assert db.job_status(channel_job_id("cpa_people", 1234)) == "sent"  # финализировано
     db.close()

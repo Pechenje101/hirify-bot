@@ -340,8 +340,19 @@ def _clean_lines(text: str) -> list[str]:
     return out
 
 
-def parse_vacancy_text(text: str) -> Vacancy:
+def parse_vacancy_text(
+    text: str,
+    *,
+    date_posted: str = "",
+    feed_key: str = "manual",
+    feed_label: str = "✍️ из вашего текста",
+) -> Vacancy:
     """Собирает Vacancy из произвольного текста вакансии.
+
+    date_posted/feed_key/feed_label — для источников мониторинга (ТГ-каналы):
+    дата публикации поста и метка раздела, чтобы карточка и рассылка
+    подписчиков вели себя как у вакансий hirify. По умолчанию — «сегодня»
+    и «из вашего текста» (разовый рендер /card и автокарточек).
 
     Гарантии: никогда не бросает исключение по содержимому; минимум, который
     возвращаем всегда — описание (исходный текст) и title из первой строки.
@@ -437,10 +448,10 @@ def parse_vacancy_text(text: str) -> Vacancy:
         location=location,
         skills=skills,
         description=description,
-        date_posted=date.today().isoformat(),  # футер «опубликовано DD.MM.YYYY»
+        date_posted=(date_posted or date.today().isoformat()),  # футер «опубликовано DD.MM.YYYY»
         contacts=contacts,
-        feed_key="manual",
-        feed_label="✍️ из вашего текста",
+        feed_key=feed_key,
+        feed_label=feed_label,
     )
 
 
@@ -470,8 +481,11 @@ _LABEL_WORDS = re.compile(
 )
 # Соискатель описывает СЕБЯ, а не вакансию: «ищу работу», «моё резюме» —
 # не карточка, а просьба. Срабатывание на такое — главный ложный сигнал.
+# ВАЖНО: голое «резюме»/«resume» сюда НЕ входит — в постах каналов-вакансий
+# «Резюме: @hr» — это инструкция откликнуться, а не рассказ о себе.
 _SEEKER_WORDS = re.compile(
-    r"(?i)\b(?:ищу\s+(?:работу|вакансию|проект)|резюме|cv\b|resume|"
+    r"(?i)\b(?:ищу\s+(?:работу|вакансию|проект)|(?:мо[её]|сво[её])\s+резюме|"
+    r"резюме\s+(?:в|ниже)|my\s+(?:cv|resume)|"
     r"рассматриваю\s+(?:вакансии|предложения)|open\s+to\s+work)\b"
 )
 AUTOCARD_MIN_CHARS = 80  # короче 80 символов вакансию не описывают

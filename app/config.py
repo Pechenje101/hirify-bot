@@ -35,19 +35,24 @@ def _get_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class Feed:
-    """Один источник вакансий (раздел hirify.me).
+    """Один источник вакансий.
 
-    api_params — дополнительные параметры API-фида раздела
-    (GET /api/vacancies?{api_params}&{feed_params}&page=N):
-      remote  → work_format=remote
-      global  → remote_type=global
-      crypto  → search=crypto (+ клиентская проверка крипто-признаков)
+    source:
+      "hirify" — раздел сайта hirify.me; api_params — параметры JSON-API
+      (GET /api/vacancies?{api_params}&{feed_params}&page=N):
+        remote  → work_format=remote
+        global  → remote_type=global
+        crypto  → search=crypto (+ клиентская проверка крипто-признаков)
+      "tg"     — публичный Telegram-канал (читается анонимно через
+      t.me/s/<channel>); channel — имя канала без @ и ссылок.
     """
 
-    key: str          # короткое имя: remote / global / crypto …
+    key: str          # короткое имя: remote / global / tg_cpa_people …
     label: str        # человекочитаемая метка для карточки и статуса
     base_url: str     # адрес лендинга (HTML-фолбэк и человеческие ссылки)
-    api_params: str = ""  # фильтр раздела для JSON-API
+    api_params: str = ""  # фильтр раздела для JSON-API (hirify)
+    source: str = "hirify"  # "hirify" | "tg"
+    channel: str = ""       # имя ТГ-канала (для source="tg")
 
 
 # Готовые «разделы» hirify.me. Лендинги — те же фид-страницы сайта с
@@ -95,6 +100,45 @@ def parse_feeds(raw: str) -> list[Feed]:
     return feeds or [FEED_PRESETS[k] for k in ("remote", "global", "crypto")]
 
 
+def _pretty_channel_label(name: str) -> str:
+    """cpa_people → «Cpa People», payments_lenkep → «Payments Lenkep»."""
+    return " ".join(w for w in name.replace("-", "_").split("_") if w).title()
+
+
+def parse_tg_channels(raw: str) -> list[Feed]:
+    """'cpa_people,opento_igaming' → каналы-источники (source="tg").
+
+    Элемент — имя канала (с/без @, с/без https://t.me/… или t.me/s/…).
+    Ключ — tg_<имя в нижнем регистре> (стабилен при любом регистра имён),
+    подпись — человекочитаемая «📡 Cpa People». Пусто → [].
+    """
+    feeds: list[Feed] = []
+    seen: set[str] = set()
+    for part in (raw or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "t.me/" in token:  # https://t.me/s/name | https://t.me/name | t.me/name
+            token = token.split("t.me/", 1)[1]
+            if token.startswith("s/"):
+                token = token[2:]
+        token = token.strip().strip("@").strip("/")
+        if not token or " " in token:
+            continue
+        key = f"tg_{token.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        feeds.append(Feed(
+            key=key,
+            label=f"📡 {_pretty_channel_label(token)}",
+            base_url=f"https://t.me/{token}",
+            source="tg",
+            channel=token,
+        ))
+    return feeds
+
+
 @dataclass
 class Config:
     """Все настройки бота."""
@@ -108,6 +152,13 @@ class Config:
     # Какие разделы hirify.me мониторим (через запятую):
     #   remote, global, crypto, crypto_remote, all  — или свой лендинг '/…'
     hirify_feeds: str = field(default_factory=lambda: os.getenv("HIRIFY_FEEDS", "remote,global,crypto"))
+    # Публичные Telegram-каналы-источники (через запятую: имена/ссылки):
+    # читаются АНОНИМНО через веб-превью t.me/s/<имя> — без аккаунта и без
+    # бота в канале. Посты проходят тем же конвейером: детектор вакансии →
+    # карточки → рассылка. Пусто (по умолчанию) = каналов нет; боевой список
+    # задаётся окружением (bot.yml на Actions: cpa_people, opento_igaming,
+    # payments_lenkep, IT_iGaming).
+    tg_channels: str = field(default_factory=lambda: os.getenv("TG_CHANNELS", "").strip())
     # Общие параметры фида (добавляются к каждому разделу).
     # Полный список: см. README (only_direct_contact, contact_types, countries,
     # salary_from, grade, sort_by, page и т.д.)
@@ -221,8 +272,8 @@ class Config:
 
     @property
     def feeds(self) -> list[Feed]:
-        """Активные разделы мониторинга (парсим HIRIFY_FEEDS на лету)."""
-        return parse_feeds(self.hirify_feeds)
+        """Активные источники мониторинга: разделы hirify + ТГ-каналы."""
+        return parse_feeds(self.hirify_feeds) + parse_tg_channels(self.tg_channels)
 
     def feed_url_for_page(self, feed: Feed, page: int) -> str:
         """URL лендинга раздела с общими параметрами и номером страницы."""

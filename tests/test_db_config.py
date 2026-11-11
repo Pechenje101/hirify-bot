@@ -161,6 +161,7 @@ def test_config_env(monkeypatch=None):
     os.environ["USE_WIDGET"] = "0"
     os.environ["HIRIFY_FEEDS"] = "crypto,global"
     os.environ["REMOTE_STRICT"] = "0"
+    os.environ["TG_CHANNELS"] = "cpa_people,https://t.me/s/payments_lenkep"
     from app.config import Config as C
     cfg = C()
     assert cfg.feed_params == "countries=ru&only_direct_contact=1"
@@ -168,10 +169,13 @@ def test_config_env(monkeypatch=None):
     assert cfg.fast_poll_sec == 45.0
     assert cfg.use_rich is False
     assert cfg.use_widget is False
-    assert [f.key for f in cfg.feeds] == ["crypto", "global"]
+    # источники = разделы hirify + каналы (в заданном порядке)
+    assert [f.key for f in cfg.feeds] == ["crypto", "global",
+                                          "tg_cpa_people", "tg_payments_lenkep"]
+    assert cfg.feeds[2].source == "tg" and cfg.feeds[2].channel == "cpa_people"
     assert cfg.remote_strict is False and cfg.crypto_strict is True
     for k in ("HIRIFY_FEED_PARAMS", "POLL_MINUTES", "FAST_POLL_SEC", "USE_RICH",
-              "USE_WIDGET", "HIRIFY_FEEDS", "REMOTE_STRICT"):
+              "USE_WIDGET", "HIRIFY_FEEDS", "REMOTE_STRICT", "TG_CHANNELS"):
         os.environ.pop(k, None)
 
 
