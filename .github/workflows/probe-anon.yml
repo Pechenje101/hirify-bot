@@ -1,0 +1,25 @@
+name: probe-anon
+
+# Анонимный зонд api.hirify.me (БЕЗ cookie): фид без сессии, поля элементов,
+# search= по индустриям, имперсонация Chrome через curl_cffi. Вакансии и
+# контакты не трогаем — риска для аккаунта ноль. Бота не перезапускает
+# (не входит в paths-фильтр bot.yml).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt h2 curl_cffi
+
+      - name: Анонимный зонд фида (без cookie)
+        run: python tools/probe_anon.py
