@@ -129,6 +129,10 @@ class Config:
     #                  крипто-признаками (заголовок/навыки/описание).
     remote_strict: bool = field(default_factory=lambda: _get_bool("REMOTE_STRICT", True))
     crypto_strict: bool = field(default_factory=lambda: _get_bool("CRYPTO_STRICT", True))
+    # Строгий фильтр целевых индустрий: рассылать ТОЛЬКО вакансии из iGaming /
+    # гемблинга / беттинга, дейтинга, high-risk- и NDA-проектов, крипты и смежных
+    # (признаки — INDUSTRY_RE в parsing.py). Обычные компании отсеиваются.
+    industry_strict: bool = field(default_factory=lambda: _get_bool("INDUSTRY_STRICT", True))
 
     # Пауза между загрузками страниц вакансий, сек (вежливость к сайту)
     fetch_delay_sec: float = field(default_factory=lambda: _get_float("FETCH_DELAY_SEC", 1.5))

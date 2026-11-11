@@ -64,13 +64,27 @@ class Vacancy:
     @property
     def is_crypto(self) -> bool:
         """Есть ли явные крипто/блокчейн-признаки (заголовок, навыки, описание)."""
-        blob = " ".join(
+        return bool(CRYPTO_RE.search(self._search_blob()))
+
+    @property
+    def is_target_industry(self) -> bool:
+        """Целевая ли индустрия: iGaming / гемблинг / беттинг / дейтинг /
+        high-risk-проекты / NDA-проекты / крипта — или смежные.
+
+        Индикаторы ищем там же, где крипто-признаки: заголовок + навыки +
+        компания + первые 1500 знаков описания.
+        """
+        blob = self._search_blob()
+        return bool(INDUSTRY_RE.search(blob) or CRYPTO_RE.search(blob))
+
+    def _search_blob(self) -> str:
+        """Сводный текст вакансии для индустриальных регекспов."""
+        return " ".join(
             [self.title or ""]
             + list(self.skills or [])
             + [self.company or ""]
             + [(self.description or "")[:1500]]
         )
-        return bool(CRYPTO_RE.search(blob))
 
     @property
     def is_non_remote(self) -> bool:
@@ -155,6 +169,33 @@ CRYPTO_RE = re.compile(
     r"|криптокошел[\w-]*|криптоэкосистем[\w-]*"
     r"|майнинг[\w-]*|смарт-?контракт[\w-]*|токеномик[\w-]*|дефи(?:-[\w-]*)?(?![а-яё])|нфт[\w-]*"
     r"|цифровы[ея] активы?"
+    r")"
+)
+
+# Целевые индустрии «высокого риска»: iGaming, gambling, betting, дейтинг,
+# high-risk-проекты, NDA-проекты и смежные (крипта — отдельный CRYPTO_RE).
+# Намеренно узкие шаблоны: plain «gaming» (геймдев), «слот времени»,
+# «знакомство с командой» и «процентные ставки» НЕ должны матчиться.
+INDUSTRY_RE = re.compile(
+    r"(?i)(?<![\w])(?:"
+    # --- латиница: iGaming / gambling / betting ---
+    r"i[-\s]?gaming\b|gambl\w*"
+    r"|bet(?:ting|s)?\b|bookmak\w*|sports?[-\s]?book\w*"
+    r"|casino\w*|poker\b|pokies\b|slots\b|slot\s+machin\w*"
+    r"|roulette\b|baccarat\b|blackjack\b|craps\b|keno\b|bingo\b"
+    r"|lotter(?:y|ies)\b|lotto\b|sweepstak\w*"
+    r"|fantasy\s+sport\w*"
+    # --- High Risk / NDA ---
+    r"|high[-\s]?risk\w*"
+    r"|nda\b"
+    # --- Dating ---
+    r"|dating\w*"
+    # --- кириллица ---
+    r"|казин\w*|г[еэ]мблинг\w*|букмекер\w*|тотализатор\w*"
+    r"|ставки\s+на\s+спорт|спортивн\w*\s+ставк\w*|при[её]м\w*\s+ставок"
+    r"|покер\w*|рулетк\w*|слот(?:ы|ов|ах|ами)\b|слот[-\s]?машин\w*|лотере\w*|лото\b"
+    r"|высок(?:ий|ого|ая|ой|их|им)[-\s]?риск\w*|высокориск\w*"
+    r"|дейт\w*|знакомств\w*"
     r")"
 )
 

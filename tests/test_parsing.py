@@ -199,6 +199,39 @@ def test_crypto_detection():
     assert not vac(title="Product Manager", description="Fintech-проект, платежи, эквайринг").is_crypto
 
 
+def test_target_industry_detection():
+    from app.parsing import Vacancy
+
+    def vac(title="", skills=None, description="", company=""):
+        return Vacancy(
+            job_id=1, slug="s", url="u", title=title,
+            skills=skills or [], description=description, company=company,
+        )
+
+    # позитивные: iGaming / gambling / betting / casino
+    assert vac(title="Backend Developer (iGaming)").is_target_industry
+    assert vac(title="Sportsbook Data Engineer").is_target_industry
+    assert vac(company="Betting Group Ltd").is_target_industry
+    assert vac(title="Frontend Dev", company="Rocket Casino").is_target_industry
+    assert vac(title="Copywriter", description="казино, покер, рулетка").is_target_industry
+    assert vac(title="Аналитик", description="букмекерская контора, ставки на спорт").is_target_industry
+    # NDA-проекты / high-risk
+    assert vac(title="Java Developer", description="проект под NDA, Кипр").is_target_industry
+    assert vac(title="Risk Analyst", description="high-risk payment processing").is_target_industry
+    assert vac(title="Инженер", description="высокие риски, онлайн-казино").is_target_industry
+    # дейтинг
+    assert vac(title="Backend Developer, Dating App").is_target_industry
+    assert vac(title="Мобильный разработчик", description="сервис знакомств").is_target_industry
+    # крипта (смежная) — через CRYPTO_RE
+    assert vac(title="Solidity Engineer").is_target_industry
+    # негативные: «обычные» компании и ложные друзья
+    assert not vac(title="Python Backend Developer", description="CRUD API, постгрес, docker").is_target_industry
+    assert not vac(title="Unity Developer", description="mobile gaming studio").is_target_industry  # геймдев ≠ iGaming
+    assert not vac(title="Финансовый аналитик", description="процентные ставки").is_target_industry
+    assert not vac(title="HR-менеджер", description="выберите удобный слот для созвона").is_target_industry
+    assert not vac(title="Data Engineer", description="define metrics and dashboards").is_target_industry
+
+
 def test_feed_fields_on_vacancy():
     from app.parsing import Vacancy
 

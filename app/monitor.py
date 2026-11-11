@@ -316,6 +316,15 @@ class Monitor:
                 log.debug("job %d: крипто-признаков нет — пропускаю", job_id)
                 continue
 
+            # ФИЛЬТР 3: только целевые индустрии (iGaming/гемблинг/беттинг/
+            # дейтинг/high-risk/NDA-проекты/крипта и смежные). Вакансии «обычных»
+            # компаний не рассылаются — финализируем без доставки
+            if self.cfg.industry_strict and not v.is_target_industry:
+                self.db.mark_job(job_id, "skipped_off_industry")
+                stats["filtered"] += 1
+                log.debug("job %d: целевых индустрий нет — пропускаю", job_id)
+                continue
+
             # рассылка: только тем, кто выбрал этот раздел в /settings
             recipients = self._recipients_for(v, subscribers)
             if not recipients:

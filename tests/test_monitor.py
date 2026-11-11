@@ -108,6 +108,7 @@ def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient
     cfg.hirify_feeds = monkeypatch_feeds
     cfg.remote_strict = False
     cfg.crypto_strict = False
+    cfg.industry_strict = False  # по умолчанию включён; в базовых тестах выключен
     client = FakeClient(FEED_ITEMS, VACANCIES)
     sender = FakeSender()
     # mkdtemp не авто-удаляется: соединение sqlite живёт дольше функции
@@ -372,6 +373,25 @@ def test_scam_vacancies_are_skipped():
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["filtered"] == 1
     assert all(t != "Miracle CTO Fund" for _, t in sender.sent)
+    db.close()
+
+
+def test_off_industry_vacancies_are_filtered():
+    """INDUSTRY_STRICT: уходит только целевая индустрия (крипта/iGaming/...),
+    вакансии «обычных» компаний отфильтровываются без ретраев."""
+    igaming = vacancy_json("Sportsbook Backend Developer", 104)
+    api = dict(VACANCIES)
+    api["104-sportsbook-backend-developer"] = (igaming, contacts_json("igaming_hr"))
+    feed = FEED_ITEMS + [{"id": 104, "slug": "104-sportsbook-backend-developer", "source": "telegram"}]
+    mon, _, sender, db = make_monitor()
+    mon.cfg.industry_strict = True
+    mon.client = FakeClient(feed, api)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    # 101 (крипта) и 104 (спортсбук) — целевые; 102 — обычный фронт: отфильтрован
+    assert stats["filtered"] == 1
+    assert sender.sent == [(1, "Solidity Engineer"), (1, "Sportsbook Backend Developer")]
+    assert db.job_status(102) == "skipped_off_industry"
+    assert db.job_status(104) == "sent"
     db.close()
 
 

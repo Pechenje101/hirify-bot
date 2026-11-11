@@ -254,7 +254,12 @@ HIRIFY_FEEDS=remote,global,crypto        # по умолчанию: все тр�
   вакансии без признаков не трогаем;
 - `CRYPTO_STRICT=1` (по умолчанию) — из раздела crypto остаются только вакансии
   с крипто-признаками (blockchain, web3, solidity, криптовалюта, биржи типа
-  Binance/OKX/Bybit, USDT и т.д. — заголовок, навыки, компания или описание).
+  Binance/OKX/Bybit, USDT и т.д. — заголовок, навыки, компания или описание);
+- `INDUSTRY_STRICT=1` (по умолчанию) — рассылать только вакансии целевых индустрий:
+  iGaming, gambling, betting, дейтинг, high-risk- и NDA-проекты, крипта и смежные
+  (casino, sportsbook, букмекер, лотерея, fantasy sports и т.д. — полный список
+  паттернов `INDUSTRY_RE` в `app/parsing.py`). Вакансии «обычных» компаний
+  отсеиваются как `skipped_off_industry`.
 
 Отсеянные вакансии видны в `/stats` как «Не прошло фильтр раздела».
 

@@ -56,6 +56,7 @@ jobs:
           HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
           RUN_MAX_MINUTES: '330'
           DROP_PENDING_UPDATES: '0'
+          INDUSTRY_STRICT: '1'
           LOG_LEVEL: INFO
         run: python main.py
 
