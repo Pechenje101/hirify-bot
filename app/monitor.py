@@ -19,6 +19,12 @@ COOKIE_WARN_COOLDOWN_SEC = 6 * 3600  # не чаще раза в 6 часов
 NUDGE_COOLDOWN_SEC = 60              # /start не должен дёргать фид чаще раза в минуту
 MAX_FETCH_ATTEMPTS = 3               # столько раз пробуем загрузить страницу вакансии
 MAX_SEND_ATTEMPTS = 10               # потолок ретраев доставки (send_failed → failed)
+# Сайт помечает «автоматизацию» → контакты закрыты на ~24 ч. Долбить дальше
+# бессмысленно и вредно: ждём час-полтора и пробуем снова (вакансии не сгорают).
+AUTOMATION_COOLDOWN_SEC = 90 * 60
+# Сайт помечает «автоматизацию» → контакты закрыты на ~24 ч. Долбить дальше
+# бессмысленно и вредно: ждём час-полтора и пробуем снова (вакансии не сгорают).
+AUTOMATION_COOLDOWN_SEC = 90 * 60
 
 
 class Monitor:
@@ -29,6 +35,7 @@ class Monitor:
         self.sender = sender
         self._last_cookie_warn = 0.0
         self._last_poll_ts = 0.0
+        self._automation_until = 0.0    # до этого момента сайт просит «не автоматизировать»
         self._running = False
         self._busy = False
         self._wake = asyncio.Event()
@@ -193,10 +200,17 @@ class Monitor:
             log.debug("Новых вакансий нет")
             return stats
 
-        # без подписчиков открывать страницы смысла нет — экономим запросы
+        # без подписчиков открывать вакансии смысла нет — экономим запросы
         subscribers = self.db.subscriber_settings()
         if not subscribers:
             log.debug("Подписчиков нет — новые вакансии пропускаю (вернутся как ретрай)")
+            return stats
+
+        # после флага «автоматизация» даём сайту остыть: фиды смотрим (это
+        # дёшево и не карается), но вакансии не трогаем до конца паузы
+        if time.time() < self._automation_until:
+            log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии подождут",
+                     (self._automation_until - time.time()) / 60)
             return stats
 
         # 3) открываем каждую страницу вакансии, ищем контакты
@@ -215,10 +229,12 @@ class Monitor:
                 data = await self.client.fetch_vacancy(full_slug)
                 contacts_data = await self.client.fetch_contacts(full_slug)
             except HirifyAutomationError as e:
-                # временный флаг «автоматизация»: дальше не долбаем — вакансии
-                # остаются необработанными и вернутся в следующем проходе,
-                # когда флаг спадёт (иначе можно усугубить)
-                log.warning("Сайт заподозрил автоматизацию — приостанавливаю проход: %s", e)
+                # сайт пометил аккаунт: контакты закрыты ~на 24 ч. Длинная
+                # пауза — вакансии остаются fetch_failed и вернутся позже,
+                # попытки НЕ сгорают (bump не делаем)
+                log.warning("Сайт заподозрил автоматизацию — пауза %d мин: %s",
+                            AUTOMATION_COOLDOWN_SEC // 60, e)
+                self._automation_until = time.time() + AUTOMATION_COOLDOWN_SEC
                 self.db.mark_job(job_id, "fetch_failed")
                 stats["fetch_failed"] += 1
                 break

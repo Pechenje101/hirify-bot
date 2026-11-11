@@ -453,6 +453,7 @@ def test_automation_flag_stops_poll_and_retries_later():
     assert sender.sent == []
     # флаг спал — следующий проход доставляет всё
     flagged.flagged = False
+    mon._automation_until = 0.0  # пауза закончилась
     stats2 = asyncio.run(mon.poll_once(source="test"))
     assert stats2["sent"] == 2
     assert db.job_status(101) == "sent"
