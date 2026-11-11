@@ -124,7 +124,10 @@ async def cmd_start(message: Message, services: Services):
     if not await _ensure_private(message):
         return
     services.db.add_subscriber(message.chat.id, message.from_user.username if message.from_user else None)
-    await message.answer(texts.WELCOME, parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(
+        texts.WELCOME.format(rhythm=texts.poll_rhythm(services.cfg.poll_minutes)),
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
     # сразу покажем демо-карточку (в выбранном подписчиком виде), чтобы был понятен формат
     sub = services.db.subscriber(message.chat.id)
     await services.sender.send_vacancy(
@@ -136,8 +139,11 @@ async def cmd_start(message: Message, services: Services):
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(texts.HELP, parse_mode="HTML", disable_web_page_preview=True)
+async def cmd_help(message: Message, services: Services):
+    await message.answer(
+        texts.HELP.format(rhythm=texts.poll_rhythm(services.cfg.poll_minutes)),
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("test"))

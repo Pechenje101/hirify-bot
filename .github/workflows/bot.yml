@@ -67,6 +67,10 @@ jobs:
           RUN_MAX_MINUTES: '330'
           DROP_PENDING_UPDATES: '0'
           INDUSTRY_STRICT: '1'
+          # «суточный цикл человека»: базовый интервал 30 мин (с джиттером
+          # ~25–40), ночью ×3, утренний проход «метлой». Меньше запросов к
+          # сайту — меньше поводов для флага automation_detected.
+          POLL_MINUTES: '30'
           LOG_LEVEL: INFO
         run: python main.py
 

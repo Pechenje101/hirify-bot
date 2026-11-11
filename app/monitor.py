@@ -35,6 +35,18 @@ AUTOMATION_POLL_SEC = 30 * 60
 # Джиттер интервала опроса: «ровно каждые N минут» — классическая подпись
 # бота; человек ходит по сайту неровно. X0.8–1.35 от базового интервала.
 POLL_JITTER = (0.8, 1.35)
+# Суточный ритм человека: ночью (01:00–06:59 МСК) мы спим — «тихие» проходы
+# удлиняются втрое; утром первый проход за день глубокий («метла», та же
+# что после паузы автоматизации) — собирает ночной бэклог с запасом страниц.
+# Это НЕ маскировка под человека, а честное расписание: меньше ночных
+# запросов — меньше поводов для флага и меньше нагрузки на сайт.
+NIGHT_HOURS = (1, 7)    # МСК: [1, 7) — «спим»
+NIGHT_SLOWDOWN = 3.0
+
+
+def _msk_hour(ts: float | None = None) -> int:
+    """Час по МСК (UTC+3 без переходов на летнее время) — для суточного ритма."""
+    return int((time.time() if ts is None else ts) // 3600 + 3) % 24
 
 
 class Monitor:
@@ -104,12 +116,14 @@ class Monitor:
         return self.cfg.poll_minutes * 60
 
     def _post_poll_wait(self, stats: dict) -> float:
-        """Интервал сна после прохода — с «человеческим» джиттером.
+        """Интервал сна после прохода — с «человеческим» джиттером и суточным ритмом.
 
         Ровный метроном «раз в N минут, круглые сутки» — верный способ
         получить флаг automation_detected: так не browse'ит ни один человек.
-        Поэтому базовый интервал гуляет (×0.8–1.35). А пока сайт держит
-        флаг автоматизации — переворачиваем фиды редко (раз в 30 мин) и
+        Поэтому базовый интервал гуляет (×0.8–1.35), а ночью (01:00–07:00 МСК)
+        «тихие» проходы удлиняются втрое — как спящий человек. Быстрые
+        повторы после находок не замедляются: ночной «хвост пачки» тоже
+        надо добрать. Пока сайт держит флаг — фиды дёргаем редко и
         просыпаемся точно к концу паузы.
         """
         if stats.get("automation_pause"):
@@ -117,7 +131,28 @@ class Monitor:
             if left > 0:
                 return min(AUTOMATION_POLL_SEC, left + 30.0)
         base = self.next_interval(stats)
+        if base >= self.cfg.poll_minutes * 60:
+            base *= self._night_slowdown()  # ночью «спим» — интервал ×3
         return max(60.0, base * random.uniform(*POLL_JITTER))
+
+    def _night_slowdown(self) -> float:
+        """Во сколько раз удлинять «тихие» ночные проходы (днём — 1.0)."""
+        h = _msk_hour()
+        return NIGHT_SLOWDOWN if NIGHT_HOURS[0] <= h < NIGHT_HOURS[1] else 1.0
+
+    @staticmethod
+    def _today_msk() -> str:
+        """Дата (YYYY-MM-DD) по МСК — метка «сегодня уже мели»."""
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 3600))
+
+    def _morning_sweep_due(self) -> bool:
+        """Первый за день проход ПОСЛЕ ночи (час ≥ 7 МСК) и глубокая проверка
+        сегодня ещё не была. Ночью и до неё — False: разборка ночного бэклога
+        на утреннем проходе, а не среди ночи.
+        """
+        if _msk_hour() < NIGHT_HOURS[1]:
+            return False
+        return self.db.get_setting("deep_sweep_date", "") != self._today_msk()
 
     async def _sleep(self, seconds: float) -> None:
         """Сон, который можно прервать: /resume, /start (nudge) или stop()."""
@@ -202,15 +237,23 @@ class Monitor:
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
         stats = self._new_stats()
 
-        # 0) пауза автоматизации только что истекла → первый проход — «метла»:
-        # пока сайт держал флаг, вакансии копились и хвост мог уйти со страницы 1
-        # навсегда; проходим фид глубже обычного, чтобы ничего не потерять
+        # 0) «метла» — глубокий первый проход (catchup_feed_pages), чтобы хвост
+        # бэклога не ушёл со страницы 1 навсегда. Два повода, один раз в сутки:
+        # (а) пауза автоматизации только что истекла — вакансии копились, пока
+        # сайт держал флаг; (б) утро после ночного затишья — «человек проснулся
+        # и пролистал ленту с запасом». Метка даты в БД — «метла» не
+        # повторяется каждый проход и переживает замещение ранов.
         pages = self.cfg.feed_pages
         if 0 < self._automation_until <= time.time():
             pages = max(pages, self.cfg.catchup_feed_pages)
             self._automation_until = 0.0
             self.db.set_setting("automation_until", "0")
+            self.db.set_setting("deep_sweep_date", self._today_msk())
             log.info("Пауза автоматизации истекла — прохожу фид «метлой»: %d стр. на раздел", pages)
+        elif self._morning_sweep_due():
+            pages = max(pages, self.cfg.catchup_feed_pages)
+            self.db.set_setting("deep_sweep_date", self._today_msk())
+            log.info("Утренний проход после ночи — фид «метлой»: %d стр. на раздел", pages)
 
         # 1) фид каждого раздела — из JSON-API: только вакансии с прямыми
         #    TG-контактами, серверная фильтрация (HTML-лендинг такое не умеет)

@@ -653,3 +653,81 @@ def test_catchup_sweep_after_pause_expires():
     assert client.pages_fetched == before + 1
     assert stats["total"] == 0 and stats2["total"] == 0
     db.close()
+
+
+# ------------------------------------------- суточный ритм: ночь и утро
+
+def test_night_hours_slowdown(monkeypatch):
+    """Ночь (01:00–06:59 МСК): «тихие» проходы втрое длиннее, но по-прежнему
+    с джиттером; быстрые повторы после находок не замедляются — хвост пачки
+    добираем сразу; днём замедления нет, границы часа — по МСК."""
+    from app.monitor import NIGHT_SLOWDOWN, POLL_JITTER
+
+    mon, _, _, db = make_monitor()
+    base = mon.cfg.poll_minutes * 60
+    fast = mon.cfg.fast_poll_sec
+
+    # 03:00 МСК — спим
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 3)
+    assert mon._night_slowdown() == NIGHT_SLOWDOWN
+    waits = {round(mon._post_poll_wait({"total": 0, "sent": 0})) for _ in range(40)}
+    lo, hi = base * NIGHT_SLOWDOWN * POLL_JITTER[0], base * NIGHT_SLOWDOWN * POLL_JITTER[1]
+    assert all(lo - 1 <= w <= hi + 1 for w in waits)
+    assert len(waits) > 5, "ночные интервалы не гуляют — метроном вернулся"
+    # было движение — быстрый повтор БЕЗ ночного замедления
+    w_fast = mon._post_poll_wait({"total": 1, "sent": 1})
+    assert fast * POLL_JITTER[0] - 1 <= w_fast <= fast * POLL_JITTER[1] + 1
+
+    # 12:00 МСК — день, замедления нет
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 12)
+    assert mon._night_slowdown() == 1.0
+    w_day = mon._post_poll_wait({"total": 0, "sent": 0})
+    assert w_day <= base * POLL_JITTER[1]
+
+    # границы: 00:59 ещё день, 07:00 уже утро
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 0)
+    assert mon._night_slowdown() == 1.0
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 7)
+    assert mon._night_slowdown() == 1.0
+    db.close()
+
+
+def test_morning_deep_sweep_once_per_day(monkeypatch):
+    """Первый проход после ночи (час ≥ 7 МСК) — «метла» глубиной
+    catchup_feed_pages, ОДИН раз в день (метка даты в БД — переживает
+    замещение ранов); ночью «метла» не включается — бэклог ждёт утра."""
+    class DeepFeedClient(FakeClient):
+        def __init__(self, items):
+            super().__init__(items, VACANCIES)
+            self.pages_fetched = 0
+
+        async def fetch_feed_api(self, feed, page: int = 1) -> list:
+            self.pages_fetched += 1
+            return self.feed_items
+
+    items = [{"id": 300 + i, "slug": f"{300 + i}-job", "source": "telegram"}
+             for i in range(15)]
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 9)  # утро
+    mon, _, sender, db = make_monitor()
+    client = DeepFeedClient(items)
+    mon.client = client
+    mon.cfg.catchup_feed_pages = 4
+    for it in items:  # все уже известны — «метла» только листает фид
+        db.add_job(it["id"], it["slug"], "https://hirify.me/jobs/x")
+        db.mark_job(it["id"], "sent")
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert client.pages_fetched == 4          # утренняя «метла»: 4 страницы
+    assert db.get_setting("deep_sweep_date", "") == mon._today_msk()
+
+    before = client.pages_fetched
+    stats2 = asyncio.run(mon.poll_once(source="test"))
+    assert client.pages_fetched == before + 1  # второй проход — обычная глубина
+
+    # ночью даже без метки «метла» не включается — ждём утра
+    monkeypatch.setattr("app.monitor._msk_hour", lambda ts=None: 3)
+    db.set_setting("deep_sweep_date", "")
+    stats3 = asyncio.run(mon.poll_once(source="test"))
+    assert client.pages_fetched == before + 2  # +1 страница, а не 4
+    assert stats["total"] == 0 and stats2["total"] == 0 and stats3["total"] == 0
+    db.close()
