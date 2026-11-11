@@ -36,6 +36,14 @@ async def main() -> int:
     try:
         items = await client.fetch_feed_api(cfg.feeds[0], 1)
         print(f"фид «{cfg.feeds[0].key}»: {len(items)} элементов, замеряем первые {n}")
+        # ключевые поля элемента: есть ли в фиде бесплатный путь к заявке
+        interesting = ("application_channel", "application_id", "apply_url",
+                       "application_instructions", "can_apply_directly",
+                       "source", "source_secondary", "recruiter_meta_id")
+        first = next((it for it in items if it.get("slug")), {})
+        print("значения полей первого элемента:")
+        for k in interesting:
+            print(f"  {k} = {first.get(k)!r}")
         for it in items[:n]:
             full_slug = str(it.get("slug") or "")
             job_id = it.get("id")
