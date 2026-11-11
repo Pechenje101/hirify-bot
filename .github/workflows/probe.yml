@@ -20,6 +20,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Живая диагностика без cookie
         run: python tools/probe_live.py
+      - name: "Замер анонимного пути: % вакансий с публичным контактом"
+        run: python tools/probe_anon_rate.py 15
       - name: Диагностика API и JS
         run: python tools/probe_api.py
       - name: Скачать HTML/JS как артефакты
