@@ -15,6 +15,7 @@ from .config import Feed
 from .db import DEFAULT_DISPLAY, DISPLAY_MODES
 from .monitor import POLL_JITTER
 from .services import Services
+from .textparse import parse_vacancy_text
 
 log = logging.getLogger("hirify.handlers")
 
@@ -147,6 +148,44 @@ async def cmd_test(message: Message, services: Services):
         message.chat.id, demo_vacancy(),
         display=sub["display"] if sub else DEFAULT_DISPLAY,
     )
+
+
+@router.message(Command("card"))
+async def cmd_card(message: Message, command: CommandObject, services: Services):
+    """Карточка из СВОЕГО текста вакансии: /card <текст>.
+
+    Парсер распознаёт заголовок/компанию/зарплату/формат/грейд/скиллы/контакты
+    (app/textparse.py), дальше карточка идёт обычным путём — тем видом,
+    который выбран в /settings. В БД мониторинга ничего не пишется: это
+    разовый рендер, а не вакансия из фида.
+    """
+    if not await _ensure_private(message):
+        return
+    raw = (command.args or "").strip()
+    if not raw:
+        await message.answer(texts.CARD_HINT, parse_mode="HTML",
+                             disable_web_page_preview=True)
+        return
+    # лимит одного сообщения Telegram 4096 — команда занимает «/card », берём
+    # запас; длиннее пользовательским текстом всё равно не прислать
+    raw = raw[:4000]
+    v = parse_vacancy_text(raw)
+    sub = services.db.subscriber(message.chat.id)
+    display = sub["display"] if sub else DEFAULT_DISPLAY
+    # короткая сводка, что распозналось — сразу видно качество разбора
+    await message.answer(
+        texts.CARD_SUMMARY.format(
+            title=html_mod.escape(v.title or "—"),
+            company=html_mod.escape(v.company) if v.company else "—",
+            salary=html_mod.escape(v.salary) if v.salary else "не распознана",
+            contact=(html_mod.escape(v.primary_contact.display)
+                     if v.primary_contact else "не найден"),
+            display=DISPLAY_LABELS.get(display, display),
+        ),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await services.sender.send_vacancy(message.chat.id, v, display=display)
 
 
 @router.message(Command("fresh"))
