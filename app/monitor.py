@@ -22,9 +22,6 @@ MAX_SEND_ATTEMPTS = 10               # потолок ретраев доста�
 # Сайт помечает «автоматизацию» → контакты закрыты на ~24 ч. Долбить дальше
 # бессмысленно и вредно: ждём час-полтора и пробуем снова (вакансии не сгорают).
 AUTOMATION_COOLDOWN_SEC = 90 * 60
-# Сайт помечает «автоматизацию» → контакты закрыты на ~24 ч. Долбить дальше
-# бессмысленно и вредно: ждём час-полтора и пробуем снова (вакансии не сгорают).
-AUTOMATION_COOLDOWN_SEC = 90 * 60
 
 
 class Monitor:
@@ -186,7 +183,8 @@ class Monitor:
                     break
 
         # 2) оставляем только те, что ещё не видели (дедуп по всем разделам сразу;
-        #    send_failed/fetch_failed known_job_ids не вернёт — будет ретрай)
+        #    send_failed/fetch_failed/new known_job_ids не вернёт — будет ретрай
+        #    'new' покрывает рестарт посреди прохода: незавершённые не теряются)
         seen_in_run: set[int] = set()
         unique: list[tuple[int, str, str, object]] = []
         for row in links:
@@ -228,6 +226,7 @@ class Monitor:
                 full_slug = f"{job_id}-{slug}"
                 data = await self.client.fetch_vacancy(full_slug)
                 contacts_data = await self.client.fetch_contacts(full_slug)
+                v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
             except HirifyAutomationError as e:
                 # сайт пометил аккаунт: контакты закрыты ~на 24 ч. Длинная
                 # пауза — вакансии остаются fetch_failed и вернутся позже,
@@ -270,6 +269,17 @@ class Monitor:
                     stats["fetch_failed"] += 1
                 log.warning("Не удалось загрузить %s (попытка %d/%d): %s",
                             url, attempts, MAX_FETCH_ATTEMPTS, e)
+                continue
+            except Exception:  # noqa: BLE001 — неожиданный формат данных/сбой парсинга
+                # без этого ретраи 'new'-статуса могли бы зациклиться на битой вакансии
+                log.exception("job %d: непредвиденная ошибка обработки — на ретрай", job_id)
+                attempts = self.db.bump_job_attempts(job_id)
+                if attempts >= MAX_FETCH_ATTEMPTS:
+                    self.db.mark_job(job_id, "failed")
+                    stats["failed"] += 1
+                else:
+                    self.db.mark_job(job_id, "fetch_failed")
+                    stats["fetch_failed"] += 1
                 continue
 
             # помеченные сайтом как скам/подозрительные — не рассылаем

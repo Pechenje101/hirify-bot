@@ -62,8 +62,12 @@ def test_db_lifecycle(tmp=None):
         db.add_job(1, "slug-1", "https://hirify.me/jobs/1-slug-1")  # дубль игнорируется
         db.add_job(2, "slug-2", "https://hirify.me/jobs/2-slug-2")
 
-        assert db.known_job_ids([1, 2, 3]) == {1, 2}
+        # свежедобавленные ('new') ещё не финализированы — ретраятся
+        assert db.known_job_ids([1, 2, 3]) == set()
         assert db.job_status(1) == "new"
+        db.mark_job(1, "sent")
+        db.mark_job(2, "skipped_no_contact")
+        assert db.known_job_ids([1, 2, 3]) == {1, 2}
 
         db.update_job_parsed(1, title="T2", tg_contacts=[{"kind": "username", "value": "hr"}])
         db.mark_job(1, "sent")
@@ -92,7 +96,12 @@ def test_db_lifecycle(tmp=None):
 
 
 def test_retryable_statuses_are_not_known():
-    """send_failed/fetch_failed — не финальные: known_job_ids их не возвращает."""
+    """send_failed/fetch_failed/new — не финальные: known_job_ids их не возвращает.
+
+    'new' — вакансия добавлена в проход, который оборвался до mark_job
+    (рестарт GitHub Actions посреди прохода): её обязан ретраить,
+    иначе она молча потеряется навсегда.
+    """
     from app.db import RETRYABLE_STATUSES
 
     with tempfile.TemporaryDirectory() as td:
@@ -100,12 +109,17 @@ def test_retryable_statuses_are_not_known():
         db.add_job(1, "s1", "u1")
         db.add_job(2, "s2", "u2")
         db.add_job(3, "s3", "u3")
+        db.add_job(4, "s4", "u4")
         db.mark_job(1, "sent")
         db.mark_job(2, "send_failed")
         db.mark_job(3, "fetch_failed")
+        # 4 остался 'new' — как при рестарте посреди прохода
 
-        assert db.known_job_ids([1, 2, 3]) == {1}  # ретраятся 2 и 3
-        assert RETRYABLE_STATUSES == ("send_failed", "fetch_failed")
+        assert db.known_job_ids([1, 2, 3, 4]) == {1}  # ретраятся 2, 3 и 4
+        assert RETRYABLE_STATUSES == ("send_failed", "fetch_failed", "new")
+        # финальные статусы ретраить не надо
+        db.mark_job(4, "skipped_no_contact")
+        assert db.known_job_ids([4]) == {4}
 
         # счётчик попыток
         assert db.job_attempts(2) == 0
@@ -128,10 +142,14 @@ def test_known_job_ids_chunking():
         n = 850
         for i in range(n):
             db.add_job(i + 1, f"s{i}", f"u{i}")
+            db.mark_job(i + 1, "sent")  # финальный статус — «известна»
         ids = db.known_job_ids(list(range(1, n + 1)))
         assert ids == set(range(1, n + 1))
         # вперемешку с несуществующими
         assert db.known_job_ids([1, n, 10 ** 9]) == {1, n}
+        # чанки не путают подстановку статусов-ретраев
+        db.add_job(10 ** 8, "sx", "ux")
+        assert db.known_job_ids([10 ** 8]) == set()
         db.close()
 
 

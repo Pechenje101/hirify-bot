@@ -60,7 +60,6 @@ class VacancySender:
         """
         sent_with = "classic"
         plan = self._plan(display)
-        last_exc: Exception | None = None
         for i, (mode, sender) in enumerate(plan):
             try:
                 await sender(chat_id, v, silent)
@@ -71,7 +70,6 @@ class VacancySender:
                     self._widget_fails = 0
                 break
             except Exception as e:  # noqa: BLE001 — любой сбой → следующая ступень
-                last_exc = e
                 self._register_fail(mode, e)
                 if i == len(plan) - 1:
                     raise  # классика — последняя инстанция: ошибка уходит в монитор

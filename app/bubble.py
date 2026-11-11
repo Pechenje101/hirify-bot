@@ -26,7 +26,7 @@ from __future__ import annotations
 import html as html_mod
 import zlib
 
-from .cards import _clean_label, _contact_name, _extra_contacts, _facts_rows, _footer_line, _format_badge, _teaser
+from .cards import _clean_label, _contact_name, _extra_contacts, _facts_rows, _footer_line, _teaser
 from .parsing import Vacancy
 
 # Ограничения Bot API (с запасом)
@@ -166,7 +166,6 @@ def render_bubble_html(v: Vacancy, limit: int = BUBBLE_DESCRIPTION_LIMIT) -> str
     if v.salary:
         parts.append(f'<div class="sal">{_esc(v.salary)}</div>')
 
-    badge = _format_badge(v)
     rows = _facts_rows(v)
     if rows:
         tr = "".join(

@@ -6,6 +6,11 @@ send_failed/fetch_failed считаются «ещё не обработанны
 (known_job_ids) их не возвращает, поэтому монитор повторит попытку в
 следующем проходе (ограничено счётчиком attempts).
 
+Статус 'new' тоже не финальный: он означает «добавлена в этом проходе, но
+обработка оборвалась» (например, рестарт GitHub Actions посреди прохода).
+Если бы known_job_ids возвращал такие вакансии как «известные», они
+навсегда выпадали бы из рассылки — поэтому и они ретраятся.
+
 Настройки подписчика живут прямо в таблице subscribers:
 - feeds  — JSON-список выбранных разделов (пустая строка = «по умолчанию»,
   то есть все разделы из HIRIFY_FEEDS);
@@ -27,8 +32,10 @@ _LOCK = threading.RLock()
 DISPLAY_MODES = ("auto", "bubble", "rich", "classic")
 DEFAULT_DISPLAY = "auto"
 
-# Статусы-«не финализировано»: монитор обязан повторить попытку
-RETRYABLE_STATUSES = ("send_failed", "fetch_failed")
+# Статусы-«не финализировано»: монитор обязан повторить попытку.
+# 'new' — добавлена в проход, который оборвался до mark_job (рестарт/сбой):
+# такую вакансию нельзя считать обработанной, иначе она потеряется навсегда.
+RETRYABLE_STATUSES = ("send_failed", "fetch_failed", "new")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -98,20 +105,26 @@ class Database:
     def known_job_ids(self, ids: Iterable[int]) -> set[int]:
         """Вернуть подмножество ids, которые уже обработаны (не требуют попытки).
 
-        send_failed/fetch_failed в результат НЕ попадают — монитор их повторит.
+        send_failed/fetch_failed/new в результат НЕ попадают — монитор их
+        повторит ('new' — проход оборвался до финализации, напр. рестарт).
         Запрос идёт чанками: SQLite ограничивает число подставляемых переменных.
         """
         ids = list(ids)
         if not ids:
             return set()
         out: set[int] = set()
-        retry_clause = " AND status NOT IN ('send_failed','fetch_failed')"
+        retry_clause = (
+            " AND status NOT IN ("
+            + ",".join("?" * len(RETRYABLE_STATUSES))
+            + ")"
+        )
         with _LOCK:
             for start in range(0, len(ids), 400):
                 chunk = ids[start:start + 400]
                 ph = ",".join("?" * len(chunk))
                 rows = self.conn.execute(
-                    f"SELECT job_id FROM jobs WHERE job_id IN ({ph}){retry_clause}", chunk
+                    f"SELECT job_id FROM jobs WHERE job_id IN ({ph}){retry_clause}",
+                    chunk + list(RETRYABLE_STATUSES),
                 ).fetchall()
                 out.update(r["job_id"] for r in rows)
         return out

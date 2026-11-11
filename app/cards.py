@@ -31,7 +31,6 @@ from __future__ import annotations
 import html as html_mod
 import re
 from datetime import date, datetime
-from typing import Optional
 
 from .parsing import TGContact, Vacancy
 

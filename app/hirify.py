@@ -9,6 +9,8 @@ import asyncio
 import logging
 import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from urllib.parse import unquote
 
@@ -56,6 +58,26 @@ class HirifyAutomationError(HirifyError):
 
 class HirifyNotFound(HirifyError):
     """Страница не существует (404/410) — повторять бессмысленно."""
+
+
+def _retry_after_seconds(resp) -> float:
+    """Retry-After в секундах: по RFC 7231 заголовок может быть и числом,
+    и HTTP-датой. Дата/мусор не должны ронять проход — возвращаем запасные 5 с.
+    """
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return 5.0
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(raw)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 5.0
 
 
 class HirifyClient:
@@ -163,9 +185,9 @@ class HirifyClient:
                     raise HirifyRestrictedError(
                         f"доступ к контактам ограничен (HTTP 403): {body}")
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", "5"))
+                    retry_after = _retry_after_seconds(resp)
                     log.warning("hirify api: 429, жду %.1fs", retry_after)
-                    await asyncio.sleep(min(retry_after + 1.0, 60.0))
+                    await asyncio.sleep(min(max(retry_after, 0.0) + 1.0, 60.0))
                     continue
                 if resp.status_code in (502, 503, 504):
                     await asyncio.sleep(2.0 * (attempt + 1))
@@ -197,9 +219,9 @@ class HirifyClient:
                     # вакансия удалена — ретраить бессмысленно
                     raise HirifyNotFound(f"hirify вернул HTTP {resp.status_code} для {url}")
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", "5"))
+                    retry_after = _retry_after_seconds(resp)
                     log.warning("hirify: 429, жду %.1fs", retry_after)
-                    await asyncio.sleep(min(retry_after + 1.0, 60.0))
+                    await asyncio.sleep(min(max(retry_after, 0.0) + 1.0, 60.0))
                     continue
                 if resp.status_code in (502, 503, 504):
                     await asyncio.sleep(2.0 * (attempt + 1))
