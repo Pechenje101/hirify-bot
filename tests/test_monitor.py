@@ -588,3 +588,68 @@ def test_poll_wait_slow_and_wake_at_pause_end():
     w3 = mon._post_poll_wait({"total": 0, "sent": 0})
     assert w3 <= mon.cfg.poll_minutes * 60 * POLL_JITTER[1]
     db.close()
+
+
+# --------------------------------------- флаг автоматизации на запросе ФИДА
+
+def test_feed_automation_flag_sets_pause():
+    """403 automation_detected на ГЕТ-е фида — редкий, но реальный случай:
+    без обработки монитор продолжал бы дёргать закрытый API каждые 5 минут.
+    Теперь флаг ставит паузу с эскалацией (как для вакансий) и стопает проход."""
+    from app.hirify import HirifyAutomationError
+
+    class FeedFlaggedClient(FakeClient):
+        async def fetch_feed_api(self, feed, page: int = 1) -> list:
+            raise HirifyAutomationError("сайт заподозрил автоматизацию (HTTP 403)")
+
+    mon, _, _, db = make_monitor()
+    mon.client = FeedFlaggedClient(FEED_ITEMS, VACANCIES)
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["automation_pause"] is True
+    assert stats["total"] == 0  # ни одной вакансии не тронули
+    assert mon._automation_flag_count == 1
+    assert db.get_setting("automation_flags", "") == "1"
+    assert mon._automation_until > time.time()  # пауза стоит
+    db.close()
+
+
+# ---------------------------------------------------- «метла» после паузы
+
+def test_catchup_sweep_after_pause_expires():
+    """Пауза истекла → первый проход идёт ГЛУБОЖЕ обычного (catchup_feed_pages):
+    за часы ограничения вакансии накопились, и хвост мог уйти со страницы 1
+    навсегда. Следующий проход — уже обычная глубина."""
+    class DeepFeedClient(FakeClient):
+        """Каждая страница фида «полная» (15 вакансий) — идём до глубины прохода."""
+
+        def __init__(self, items):
+            super().__init__(items, VACANCIES)
+            self.pages_fetched = 0
+
+        async def fetch_feed_api(self, feed, page: int = 1) -> list:
+            self.pages_fetched += 1
+            return self.feed_items
+
+    items = [{"id": 200 + i, "slug": f"{200 + i}-job", "source": "telegram"}
+             for i in range(15)]
+    mon, client, sender, db = make_monitor()  # один раздел (remote)
+    client = DeepFeedClient(items)
+    mon.client = client
+    mon.cfg.catchup_feed_pages = 4
+    # все вакансии уже известны — «метла» проверяет только фид, без API-запросов
+    for it in items:
+        db.add_job(it["id"], it["slug"], "https://hirify.me/jobs/x")
+        db.mark_job(it["id"], "sent")
+
+    mon._automation_until = time.time() - 10  # пауза только что истекла
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert client.pages_fetched == 4          # прошли 4 страницы, а не одну
+    assert mon._automation_until == 0.0       # пауза зачищена
+    assert db.get_setting("automation_until", "") == "0"
+
+    # следующий проход — обычная глубина (страницы feed_pages, а не 4)
+    before = client.pages_fetched
+    stats2 = asyncio.run(mon.poll_once(source="test"))
+    assert client.pages_fetched == before + 1
+    assert stats["total"] == 0 and stats2["total"] == 0
+    db.close()

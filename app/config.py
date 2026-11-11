@@ -140,7 +140,9 @@ class Config:
 
     # --- Мониторинг ---
     # Базовый интервал проверки фида, минут. Держим небольшим: карточка должна
-    # приходить почти сразу после появления вакансии.
+    # приходить почти сразу после появления вакансии. Реальный ритм слегка
+    # плавает (джиттер в monitor.py: ×0.8–1.35 от базового) — «ровно каждые N
+    # минут, круглые сутки» — подпись бота, на которой сайты ловят автоматизацию.
     poll_minutes: float = field(default_factory=lambda: _get_float("POLL_MINUTES", 5.0))
     # Быстрая повторная проверка после прохода, в котором было новое (сек):
     # так «пачка» вакансий уходит подряд, а не ждёт следующего цикла.
@@ -148,6 +150,10 @@ class Config:
     max_per_poll: int = field(default_factory=lambda: _get_int("MAX_PER_POLL", 8))
     # Сколько страниц каждого фида просматривать за один цикл
     feed_pages: int = field(default_factory=lambda: _get_int("FEED_PAGES", 1))
+    # Глубина «метлы» после паузы автоматизации: пока сайт держал флаг, в фиде
+    # копятся вакансии, и хвост может уйти со страницы 1 навсегда — первый
+    # проход после снятия ограничения проходит столько страниц каждого фида.
+    catchup_feed_pages: int = field(default_factory=lambda: _get_int("CATCHUP_FEED_PAGES", 4))
 
     # --- Отправка ---
     # 1 = пробовать Rich Messages (Bot API 10.1+, красиво), с автооткатом на обычный HTML
@@ -163,6 +169,11 @@ class Config:
     send_delay_sec: float = field(default_factory=lambda: _get_float("SEND_DELAY_SEC", 1.2))
 
     # --- Служебное ---
+    # ID чата администратора (личный чат владельца бота): если задан, критичные
+    # команды (/setcookie, /pause, /resume) принимаются только от него — без
+    # этого любой пользователь, нашедший бота, сможет подменить cookie или
+    # остановить мониторинг для всех. 0 = гарда нет (личный бот).
+    admin_chat_id: int = field(default_factory=lambda: _get_int("ADMIN_CHAT_ID", 0))
     db_path: Path = field(default_factory=lambda: BASE_DIR / os.getenv("DB_PATH", "data/hirify_bot.db"))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     debug_dump_dir: Path = field(default_factory=lambda: BASE_DIR / "debug")

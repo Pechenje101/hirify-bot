@@ -202,13 +202,32 @@ class Monitor:
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
         stats = self._new_stats()
 
+        # 0) пауза автоматизации только что истекла → первый проход — «метла»:
+        # пока сайт держал флаг, вакансии копились и хвост мог уйти со страницы 1
+        # навсегда; проходим фид глубже обычного, чтобы ничего не потерять
+        pages = self.cfg.feed_pages
+        if 0 < self._automation_until <= time.time():
+            pages = max(pages, self.cfg.catchup_feed_pages)
+            self._automation_until = 0.0
+            self.db.set_setting("automation_until", "0")
+            log.info("Пауза автоматизации истекла — прохожу фид «метлой»: %d стр. на раздел", pages)
+
         # 1) фид каждого раздела — из JSON-API: только вакансии с прямыми
         #    TG-контактами, серверная фильтрация (HTML-лендинг такое не умеет)
         links: list[tuple[int, str, str, object]] = []  # (job_id, slug, url, feed)
         for feed in self.cfg.feeds:
-            for page in range(1, max(1, self.cfg.feed_pages) + 1):
+            for page in range(1, max(1, pages) + 1):
                 try:
                     items = await self.client.fetch_feed_api(feed, page)
+                except HirifyAutomationError as e:
+                    # флаг прилетел уже на запросе ФИДА: без паузы монитор
+                    # продолжал бы дёргать закрытый API каждые 5 минут.
+                    # Регистрируем так же, как для вакансий: пауза с эскалацией
+                    # + предупреждение админу, проход останавливаем.
+                    subscribers = self.db.subscriber_settings()
+                    self._register_automation(e, subscribers)
+                    stats["automation_pause"] = True
+                    return stats
                 except HirifyError as e:
                     log.error("Не удалось загрузить фид «%s» (страница %d): %s", feed.key, page, e)
                     break
@@ -396,15 +415,7 @@ class Monitor:
         if isinstance(e, HirifyAutomationError):
             # сайт пометил аккаунт: вакансии закрыты ~на 24 ч. Пауза с
             # эскалацией и в БД — попытки НЕ сгорают (bump не делаем)
-            count = self._automation_flag_count + 1
-            minutes = AUTOMATION_BACKOFF_MIN[min(count - 1, len(AUTOMATION_BACKOFF_MIN) - 1)]
-            self._automation_flag_count = count
-            self._automation_until = time.time() + minutes * 60
-            self.db.set_setting("automation_until", str(int(self._automation_until)))
-            self.db.set_setting("automation_flags", str(count))
-            log.warning("Сайт заподозрил автоматизацию (срабатывание №%d) — пауза %d мин: %s",
-                        count, minutes, e)
-            self._warn_automation([s["chat_id"] for s in subscribers[:1]], minutes)
+            self._register_automation(e, subscribers)
             self.db.mark_job(job_id, "fetch_failed")
             stats["fetch_failed"] += 1
             return "break"
@@ -444,6 +455,24 @@ class Monitor:
             # без этого ретраи 'new'-статуса могли бы зациклиться на битой вакансии
             log.exception("job %d: непредвиденная ошибка обработки — на ретрай", job_id)
         return "continue"
+
+    def _register_automation(self, e: Exception, subscribers: list[dict]) -> int:
+        """Флаг automation_detected: эскалирующая пауза (живёт в БД, переживает
+        замещение ранов) + предупреждение админу. Возвращает длительность, мин.
+
+        Вызывается и для вакансий (_handle_fetch_error), и для фидов (_poll_impl):
+        без этого пауза не ставилась бы, если сайт закрыл доступ уже на запросе фида.
+        """
+        count = self._automation_flag_count + 1
+        minutes = AUTOMATION_BACKOFF_MIN[min(count - 1, len(AUTOMATION_BACKOFF_MIN) - 1)]
+        self._automation_flag_count = count
+        self._automation_until = time.time() + minutes * 60
+        self.db.set_setting("automation_until", str(int(self._automation_until)))
+        self.db.set_setting("automation_flags", str(count))
+        log.warning("Сайт заподозрил автоматизацию (срабатывание №%d) — пауза %d мин: %s",
+                    count, minutes, e)
+        self._warn_automation([s["chat_id"] for s in subscribers[:1]], minutes)
+        return minutes
 
     def _automation_healed(self, subscribers: list[dict]) -> None:
         """Первый успешный полный просмотр после флага — сайт снял ограничение."""

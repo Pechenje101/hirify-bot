@@ -62,6 +62,8 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           HIRIFY_COOKIE: ${{ secrets.HIRIFY_COOKIE }}
+          # критичные команды (/setcookie, /pause, /resume) — только владелец
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           RUN_MAX_MINUTES: '330'
           DROP_PENDING_UPDATES: '0'
           INDUSTRY_STRICT: '1'

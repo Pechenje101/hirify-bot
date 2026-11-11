@@ -13,6 +13,7 @@ from . import texts
 from .cards import demo_vacancy
 from .config import Feed
 from .db import DEFAULT_DISPLAY, DISPLAY_MODES
+from .monitor import POLL_JITTER
 from .services import Services
 
 log = logging.getLogger("hirify.handlers")
@@ -89,6 +90,30 @@ async def _ensure_private(message: Message) -> bool:
     except Exception:  # noqa: BLE001
         pass
     return False
+
+
+def _is_admin(cfg, message: Message) -> bool:
+    """Гард критичных команд: если задан ADMIN_CHAT_ID — чат должен совпадать.
+    Не задан (личный бот) — пропускаем всех (прежнее поведение)."""
+    if not cfg.admin_chat_id:
+        return True
+    return message.chat.id == cfg.admin_chat_id
+
+
+async def _ensure_admin(message: Message, services: Services) -> bool:
+    """Личный чат И (если задан ADMIN_CHAT_ID) — только владелец бота.
+    Так /setcookie, /pause, /resume не сможет вызвать случайный пользователь,
+    нашедший бота: без гарда он мог бы подменить cookie или остановить
+    мониторинг для всех подписчиков."""
+    if not await _ensure_private(message):
+        return False
+    if not _is_admin(services.cfg, message):
+        try:
+            await message.answer("🔒 Команда доступна только администратору бота.")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- команды
@@ -179,6 +204,9 @@ async def cmd_stats(message: Message, services: Services):
 
 @router.message(Command("status"))
 async def cmd_status(message: Message, services: Services):
+    # cookie и состояние мониторинга — не для общего чата: показываем только в личке
+    if not await _ensure_private(message):
+        return
     paused = "⏸ выключен (/resume — включить)" if services.monitor.paused else "▶️ работает"
     automation_left = services.monitor.automation_left_sec
     automation = (
@@ -191,10 +219,13 @@ async def cmd_status(message: Message, services: Services):
         else ("Rich + классика" if services.cfg.use_rich else "классический HTML")
     )
     feeds = " · ".join(f.label for f in services.cfg.feeds)
+    # честный интервал: базовые N мин × джиттер — показываем диапазон, а не «ровно N»
+    base = services.cfg.poll_minutes
+    interval = f"~{base * POLL_JITTER[0]:.1f}–{base * POLL_JITTER[1]:.1f}"
     await message.answer(
         texts.STATUS_TMPL.format(
             paused=paused,
-            interval=services.cfg.poll_minutes,
+            interval=interval,
             fast_sec=int(services.cfg.fast_poll_sec),
             feeds=html_mod.escape(feeds),
             cookie=_fmt_cookie(services.client),
@@ -292,12 +323,16 @@ async def on_settings_callback(cb: CallbackQuery, services: Services):
 
 @router.message(Command("pause"))
 async def cmd_pause(message: Message, services: Services):
+    if not await _ensure_admin(message, services):
+        return
     services.monitor.pause()
     await message.answer(texts.PAUSED)
 
 
 @router.message(Command("resume"))
 async def cmd_resume(message: Message, services: Services):
+    if not await _ensure_admin(message, services):
+        return
     services.monitor.resume()
     await message.answer(texts.RESUMED)
 
@@ -310,9 +345,10 @@ async def cmd_unsub(message: Message, services: Services):
 
 @router.message(Command("setcookie"))
 async def cmd_setcookie(message: Message, command: CommandObject, services: Services):
-    """Обновление cookie прямо в чате (только личка). Строка не сохраняется в логах."""
-    if message.chat.type != "private":
-        await message.answer("🔒 Cookie можно менять только в личном чате с ботом.")
+    """Обновление cookie прямо в чате. Строка не сохраняется в логах.
+    Только администратор (см. _ensure_admin): чужой cookie подменит сессию
+    и рассылка пойдёт из-под чужого аккаунта."""
+    if not await _ensure_admin(message, services):
         return
     raw = (command.args or "").strip()
     if not raw or "=" not in raw or len(raw) < 20:
@@ -341,8 +377,9 @@ async def cmd_setcookie(message: Message, command: CommandObject, services: Serv
 
 @router.message()
 async def fallback(message: Message):
-    """Любое другое сообщение — подсказка."""
-    if not await _ensure_private(message):
+    """Любое другое сообщение — подсказка. В группах МОЛЧИМ: бот, добавленный
+    в группу, не должен отвечать на каждое сообщение чата (спам)."""
+    if message.chat.type != "private":
         return
     await message.answer(
         "🤖 Я понимаю только команды. Список — /help, проверить вакансии — /fresh, "
