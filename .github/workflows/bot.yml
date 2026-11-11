@@ -81,6 +81,12 @@ jobs:
             # cookie не должен попадать в публичный репозиторий: в ране он
             # приходит из секрета HIRIFY_COOKIE, из БД его вычищаем
             sqlite3 data/hirify_bot.db "DELETE FROM settings WHERE key='hirify_cookie';"
+            # ВАЖНО, WAL: бот пишет в data/hirify_bot.db-wal, основной .db при
+            # жёсткой отмене рана остаётся ПУСТЫМ (без чистого close не бывает
+            # чекпоинта) — без этой строки каждое замещение рана теряло бы ВСЁ
+            # состояние: подписчиков, дедуп, настройки. Чекпоинт вливает WAL
+            # в основной файл, который мы и коммитим.
+            sqlite3 data/hirify_bot.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
             git add -f data/hirify_bot.db
           fi
           if git diff --cached --quiet; then

@@ -367,4 +367,10 @@ class Database:
 
     def close(self) -> None:
         with _LOCK:
+            try:
+                # вливаем WAL в основной файл: после close состояние должно
+                # целиком лежать в .db (важно для коммита БД в git воркфлоуом)
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
             self.conn.close()
