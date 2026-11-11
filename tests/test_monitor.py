@@ -109,6 +109,9 @@ def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient
     cfg.remote_strict = False
     cfg.crypto_strict = False
     cfg.industry_strict = False  # по умолчанию включён; в базовых тестах выключен
+    # квоты аккаунта не должны мешать базовым тестам (много проходов подряд)
+    cfg.auth_views_hour_max = 10**9
+    cfg.auth_views_day_max = 10**9
     client = FakeClient(FEED_ITEMS, VACANCIES)
     sender = FakeSender()
     # mkdtemp не авто-удаляется: соединение sqlite живёт дольше функции
@@ -513,14 +516,22 @@ def test_automation_backoff_escalates_and_survives_restart():
     assert 239 * 60 < second - time.time() <= 240 * 60
     assert db.get_setting("automation_flags", "") == "2"
 
-    # успешный полный просмотр — счётчик и пауза сбрасываются (флаг снят)
+    # успешный полный просмотр: пауза снимается, но недавний флаг ПОМНИТСЯ —
+    # счётчик эскалации держится 48 ч (повторный флаг сразу бьёт ступенью выше)
     mon2._automation_flag_count = 1
     mon2._automation_until = 0.0  # пауза истекла — пробуем, сайт уже здоров
     healed = FakeClient(FEED_ITEMS, VACANCIES)
     mon2.client = healed
     stats = asyncio.run(mon2.poll_once(source="test"))
     assert stats["sent"] == 2
-    assert mon2._automation_flag_count == 0 and mon2._automation_until == 0.0
+    assert mon2._automation_until == 0.0
+    assert mon2._automation_flag_count == 1  # память эскалации: сброс только через 48 ч
+    assert db.get_setting("automation_flags", "") == "2"  # в БД счётчик не тронут
+
+    # а вот 48+ часов без флагов — счётчик сбрасывается полностью
+    mon2._automation_last_flag = time.time() - 49 * 3600
+    mon2._automation_healed([{"chat_id": 1}])
+    assert mon2._automation_flag_count == 0
     assert db.get_setting("automation_flags", "") == "0"
     db.close()
 
@@ -730,4 +741,137 @@ def test_morning_deep_sweep_once_per_day(monkeypatch):
     stats3 = asyncio.run(mon.poll_once(source="test"))
     assert client.pages_fetched == before + 2  # +1 страница, а не 4
     assert stats["total"] == 0 and stats2["total"] == 0 and stats3["total"] == 0
+    db.close()
+
+
+# ---------------------------------------------------------------- префильтр фида
+
+def test_prefilter_skips_off_industry_without_opening():
+    """Вакансию «мимо индустрии» видно уже по элементу фида (title+tldr):
+    не открываем вовсе — минус один «просмотр» аккаунта."""
+    items = [
+        {"id": 201, "slug": "201-sales-manager-horeca", "source": "telegram",
+         "title": "Менеджер по продажам (HoReCa)",
+         "tldr": "Опыт продаж в HoReCa от 3 лет, ведение ключевых клиентов",
+         "work_format": ["remote"], "company_title": "Ресторан"},
+        {"id": 202, "slug": "202-media-buyer-igaming", "source": "telegram",
+         "title": "Media Buyer (iGaming)",
+         "tldr": "Арбитраж трафика на betting-офферы, Facebook",
+         "work_format": ["remote"], "company_title": "NDA"},
+    ]
+    api = {"202-media-buyer-igaming": (vacancy_json("Media Buyer (iGaming)", 202),
+                                        contacts_json("igaming_hr"))}
+
+    mon, _, _, db = make_monitor()
+    mon.cfg.industry_strict = True          # боевое значение
+    spy = FakeClient(items, api)
+    mon.client = spy
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 1           # HoReCa не открывали вообще
+    assert db.job_status(201) == "skipped_off_industry"
+    assert stats["filtered"] == 1 and stats["sent"] == 1
+    db.close()
+
+
+def test_prefilter_scam_flag_skips_opening():
+    """Флаг скама приходит прямо в элементе фида — тоже не открываем."""
+    items = [{"id": 203, "slug": "203-trader", "source": "telegram",
+              "title": "Трейдер-аналитик", "tldr": "лёгкие деньги",
+              "is_scam": True, "work_format": ["remote"]}]
+    mon, _, _, db = make_monitor()
+    spy = FakeClient(items, {})
+    mon.client = spy
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 0
+    assert db.job_status(203) == "skipped_scam"
+    assert stats["filtered"] == 1
+    db.close()
+
+
+def test_prefilter_disabled_opens_everything():
+    """FEED_PREFILTER=0 — прежнее поведение: открываем и фильтруем по полным данным."""
+    items = [{"id": 204, "slug": "204-horeca", "source": "telegram",
+              "title": "Менеджер (HoReCa)", "tldr": "продажи в HoReCa",
+              "work_format": ["remote"]}]
+    api = {"204-horeca": (vacancy_json("Менеджер HoReCa", 204), contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.industry_strict = True
+    mon.cfg.feed_prefilter = False
+    spy = FakeClient(items, api)
+    mon.client = spy
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 1           # открыли, чтобы понять: мимо индустрии
+    assert db.job_status(204) == "skipped_off_industry"
+    db.close()
+
+
+def test_prefilter_item_without_text_still_opens():
+    """Элемент без title/tldr не судим — открываем, как раньше."""
+    items = [{"id": 205, "slug": "205-plain", "source": "telegram"}]
+    api = {"205-plain": (vacancy_json("Solidity Engineer", 205), contacts_json("hr"))}
+    mon, _, _, db = make_monitor()
+    mon.cfg.industry_strict = True
+    spy = FakeClient(items, api)
+    mon.client = spy
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 1           # нечего фильтровать — открыли
+    assert stats["sent"] == 1                # полный фильтр пропустил (крипта)
+    db.close()
+
+
+def test_prefilter_non_remote_work_format():
+    """Офисный формат виден в work_format элемента фида — не открываем."""
+    items = [{"id": 206, "slug": "206-office-igaming", "source": "telegram",
+              "title": "Account Manager (iGaming)", "tldr": "betting, casino",
+              "work_format": ["office"]}]
+    mon, _, _, db = make_monitor()
+    mon.cfg.remote_strict = True             # раздел remote — только удалёнка
+    mon.cfg.industry_strict = True
+    spy = FakeClient(items, {})
+    mon.client = spy
+    asyncio.run(mon.poll_once(source="test"))
+    assert spy.job_fetches == 0
+    assert db.job_status(206) == "skipped_not_remote"
+    db.close()
+
+
+# ---------------------------------------------------------------- квоты аккаунта
+
+def test_auth_hour_quota_defers_rest_of_batch():
+    """Часовой лимит запросов от имени аккаунта: остаток пачки не теряется —
+    вакансии остаются невидимыми и подбираются следующим проходом."""
+    mon, _, _, db = make_monitor()
+    mon.cfg.auth_views_hour_max = 1          # хватит ровно на одну вакансию
+
+    stats = asyncio.run(mon.poll_once(source="test"))
+    # 101-я открыта и отправлена; 102 и 103 отложены (102: 2 «просмотра»
+    # — данные+контакты — уже потрачены)
+    assert stats["sent"] == 1 and stats["quota_deferred"] >= 1
+    assert db.job_status(101) == "sent"
+    assert db.job_status(102) is None and db.job_status(103) is None  # не тронуты
+
+    mon._auth_hour_ts.clear()                # «прошёл час» — окно скользнуло
+    stats2 = asyncio.run(mon.poll_once(source="test"))
+    assert stats2["sent"] == 1               # 102-я догнана (103 — снова квота)
+    mon._auth_hour_ts.clear()
+    stats3 = asyncio.run(mon.poll_once(source="test"))
+    assert stats3["skipped"] == 1            # 103-я без TG-контакта — отсеяна
+    db.close()
+
+
+def test_auth_day_quota_persists_in_db():
+    """Суточный счётчик живёт в БД — замещение ранов не «обнуляет» лимит."""
+    mon, _, _, db = make_monitor()
+    mon.cfg.auth_views_day_max = 1
+    asyncio.run(mon.poll_once(source="test"))
+    assert db.get_setting("auth_views_count", "") == "2"   # 101: данные+контакты
+    assert db.job_status(102) is None                       # квота: не тронута
+
+    # «новый ран»: Monitor над той же БД видит потраченную квоту
+    mon2 = Monitor(mon.client, db, mon.sender, mon.cfg)
+    mon2._auth_hour_ts.clear()
+    stats = asyncio.run(mon2.poll_once(source="test"))
+    assert stats["quota_deferred"] >= 1
+    assert db.job_status(102) is None
     db.close()

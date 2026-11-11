@@ -5,13 +5,14 @@ import asyncio
 import logging
 import random
 import time
+from typing import Optional
 
 from .db import Database
 from .hirify import (
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
     HirifyNotFound, HirifyRestrictedError,
 )
-from .parsing import vacancy_from_api
+from .parsing import CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, vacancy_from_api
 from .sender import VacancySender
 
 log = logging.getLogger("hirify.monitor")
@@ -27,6 +28,10 @@ MAX_SEND_ATTEMPTS = 10               # потолок ретраев доста�
 # Живёт пауза в БД: раны замещают друг друга — в памяти она бы терялась, и
 # каждый новый ран снова дёргал бы закрытый API через минуту после старта.
 AUTOMATION_BACKOFF_MIN = (90, 240, 480, 960, 1440)   # мин, с эскалацией
+# Память эскалации: повторный флаг в течение этого окна после прошлого —
+# счётчик эскалации НЕ сбрасывается «излечением» (сайт снял флаг ≠ урок
+# усвоен). Полный сброс — только если флагов не было 48 ч подряд.
+AUTOMATION_FLAG_MEMORY_SEC = 48 * 3600
 # Пока сайт держит флаг, фиды тоже не дёргаем каждые 5 мин: раз в 30 мин
 # хватит (бэклог копится и так), зато ограниченный аккаунт не палится
 # непрерывным поллингом — возможно, каждая попытка продлевает ограничение.
@@ -61,6 +66,13 @@ class Monitor:
         # пауза после флага автоматизации — из БД (переживает замещение ранов)
         self._automation_until = self._load_ts("automation_until")
         self._automation_flag_count = int(self._load_ts("automation_flags"))
+        self._automation_last_flag = self._load_ts("automation_last_flag")
+        # квоты запросов от имени аккаунта: час — в памяти, сутки — в БД
+        # (переживают замещение ранов, как и пауза автоматизации)
+        self._auth_hour_ts: list[float] = []
+        self._auth_day = int(self._load_ts("auth_views_count"))
+        self._auth_day_date = (self.db.get_setting("auth_views_date") or "").strip()
+        self._pause_just_expired = False
         self._running = False
         self._busy = False
         self._wake = asyncio.Event()
@@ -199,7 +211,7 @@ class Monitor:
         return {
             "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
             "fetch_failed": 0, "send_failed": 0, "no_audience": 0, "cookie_warn": False,
-            "automation_pause": False,
+            "automation_pause": False, "quota_deferred": 0,
         }
 
     @staticmethod
@@ -221,7 +233,8 @@ class Monitor:
         """Один проход: фид → новые → парсинг → отправка подписчикам.
 
         Возвращает счётчики {total, sent, skipped, filtered, failed,
-        fetch_failed, send_failed, no_audience, cookie_warn, automation_pause}.
+        fetch_failed, send_failed, no_audience, cookie_warn, automation_pause,
+        quota_deferred}.
         """
         max_jobs = limit if limit is not None else self.cfg.max_per_poll
         if self._busy:
@@ -233,6 +246,8 @@ class Monitor:
         finally:
             self._busy = False
             self._last_poll_ts = time.time()
+            # «сняли флаг»-сообщение — только про СВЕЖЕИСТЕКШУЮ паузу, один раз
+            self._pause_just_expired = False
 
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
         stats = self._new_stats()
@@ -249,15 +264,17 @@ class Monitor:
             self._automation_until = 0.0
             self.db.set_setting("automation_until", "0")
             self.db.set_setting("deep_sweep_date", self._today_msk())
+            self._pause_just_expired = True  # для единственного «сняли флаг»-сообщения
             log.info("Пауза автоматизации истекла — прохожу фид «метлой»: %d стр. на раздел", pages)
         elif self._morning_sweep_due():
             pages = max(pages, self.cfg.catchup_feed_pages)
             self.db.set_setting("deep_sweep_date", self._today_msk())
             log.info("Утренний проход после ночи — фид «метлой»: %d стр. на раздел", pages)
 
-        # 1) фид каждого раздела — из JSON-API: только вакансии с прямыми
-        #    TG-контактами, серверная фильтрация (HTML-лендинг такое не умеет)
-        links: list[tuple[int, str, str, object]] = []  # (job_id, slug, url, feed)
+        # 1) фид каждого раздела — из JSON-API АНОНИМНО (cookie не тратим:
+        #    круглосуточный поллинг не должен накрывать аккаунт): только
+        #    вакансии с прямыми TG-контактами, серверная фильтрация
+        links: list[tuple[int, str, str, object, dict]] = []  # (job_id, slug, url, feed, item)
         for feed in self.cfg.feeds:
             for page in range(1, max(1, pages) + 1):
                 try:
@@ -283,7 +300,7 @@ class Monitor:
                         continue
                     full_slug = str(it.get("slug") or "")
                     short_slug = full_slug.split("-", 1)[1] if "-" in full_slug else full_slug
-                    links.append((job_id, short_slug, f"{self.cfg.hirify_base}/jobs/{full_slug}", feed))
+                    links.append((job_id, short_slug, f"{self.cfg.hirify_base}/jobs/{full_slug}", feed, it))
                 if len(items) < 15:  # в странице фида 15 вакансий — дальше пусто
                     break
 
@@ -291,13 +308,13 @@ class Monitor:
         #    send_failed/fetch_failed/new known_job_ids не вернёт — будет ретрай
         #    'new' покрывает рестарт посреди прохода: незавершённые не теряются)
         seen_in_run: set[int] = set()
-        unique: list[tuple[int, str, str, object]] = []
+        unique: list[tuple[int, str, str, object, dict]] = []
         for row in links:
             if row[0] in seen_in_run:
                 continue
             seen_in_run.add(row[0])
             unique.append(row)
-        known = self.db.known_job_ids([job_id for job_id, _, _, _ in unique])
+        known = self.db.known_job_ids([job_id for job_id, _, _, _, _ in unique])
         fresh = [row for row in unique if row[0] not in known]
         if not fresh:
             log.debug("Новых вакансий нет")
@@ -322,19 +339,43 @@ class Monitor:
         log.info("[%s] новых вакансий: %d (лимит %d, разделы: %s)", source, len(fresh), max_jobs,
                  ", ".join(f.key for f in self.cfg.feeds))
 
-        for job_id, slug, url, feed in fresh:
+        for job_id, slug, url, feed, item in fresh:
+            # квота запросов от имени аккаунта: сайт считает просмотры,
+            # и именно пачки подряд — «автоматизация». Остальные вакансии
+            # НЕ теряются: остаются невидимыми → следующий проход доберёт
+            block = self._auth_quota_block()
+            if block:
+                stats["quota_deferred"] += 1
+                log.info("Квота аккаунта (%s) — остальные %d вакансий подождут следующего прохода",
+                         block, len(fresh) - stats["total"])
+                break
+
             self.db.add_job(job_id, slug, url)
             stats["total"] += 1
             full_slug = f"{job_id}-{slug}"
-            # --- этап 1: данные вакансии (GET). Фильтры ниже решаемы уже по
-            # ним — контакты запрашиваем только для прошедших отбор
+
+            # ДЕШЁВЫЙ ПРЕФИЛЬТР: элемент фида уже содержит title/tldr/
+            # стек/флаги скама — «мимо индустрии» видно без открытия
+            # вакансии. Каждый пропущенный GET — минус один просмотр
+            # аккаунта (и минус один повод для флага автоматизации).
+            reason = self._prefilter_reason(item, feed)
+            if reason:
+                self.db.mark_job(job_id, reason)
+                stats["filtered"] += 1
+                log.debug("job %d: префильтр фида → %s (без открытия вакансии)", job_id, reason)
+                continue
+
+            # --- этап 1: данные вакансии (GET, от имени аккаунта). Фильтры
+            # ниже решаемы уже по ним — контакты запрашиваем только для
+            # прошедших отбор
             try:
                 data = await self.client.fetch_vacancy(full_slug)
-                v = vacancy_from_api(data, None, feed.key, feed.label)
             except Exception as e:  # noqa: BLE001
                 if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
                     break
                 continue
+            self._auth_view_spent()
+            v = vacancy_from_api(data, None, feed.key, feed.label)
 
             # помеченные сайтом как скам/подозрительные — не рассылаем
             if data.get("is_scam") or data.get("is_potential_scam"):
@@ -379,7 +420,7 @@ class Monitor:
                           job_id, v.feed_key)
                 continue
 
-            # --- этап 2: контакты (POST) — единственный «дорогой» запрос,
+            # --- этап 2: контакты (POST, от имени аккаунта) — «дорогой» запрос,
             # делаем его только для целевой вакансии с адресатами
             try:
                 contacts_data = await self.client.fetch_contacts(full_slug)
@@ -387,9 +428,12 @@ class Monitor:
                 if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
                     break
                 continue
+            self._auth_view_spent()
 
             v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
-            self._automation_healed(subscribers)  # полный просмотр прошёл — флага больше нет
+            # полный просмотр прошёл — флага больше нет; «сняли флаг»-
+            # сообщение шлём только если пауза только что истекла (не каждый чих)
+            self._automation_healed(subscribers, announce=self._pause_just_expired)
             self.db.update_job_parsed(
                 job_id, title=v.title, company=v.company, salary=v.salary,
                 tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
@@ -437,6 +481,87 @@ class Monitor:
         return stats
 
     # ---------------------------------------------------------------- helpers
+
+    def _prefilter_reason(self, item: dict, feed) -> Optional[str]:
+        """Дешёвый отбор ПО ЭЛЕМЕНТУ ФИДА, без открытия вакансии.
+
+        Элемент фида уже содержит title/tldr/company_title/main_stack/tags/
+        work_format и флаги скама — те же регекспы, что работают по полным
+        данным (INDUSTRY_RE/CRYPTO_RE/NON_REMOTE_RE), можно применить заранее.
+        Возврат — статус-причина (mark_job) или None («открываем как раньше»).
+
+        Осторожность: элемент без title и tldr не судим (откроем — вдруг
+        индустрия видна только в полном описании), и префильтр можно
+        выключить env-ом FEED_PREFILTER=0.
+        """
+        if not self.cfg.feed_prefilter:
+            return None
+        if item.get("is_scam") or item.get("is_potential_scam"):
+            return "skipped_scam"
+
+        title = str(item.get("title") or item.get("original_title") or "")
+        tldr = str(item.get("tldr") or "")
+        if not (title.strip() or tldr.strip()):
+            return None  # нечем судить — открываем, как раньше
+
+        company = str(item.get("company_title") or "")
+        wf = item.get("work_format")
+        wf_s = ", ".join(x for x in wf if x) if isinstance(wf, list) else str(wf or "")
+
+        # стек и теги — те же слова, что смотрит полный фильтр (skills)
+        skills: list[str] = []
+        stack = item.get("main_stack")
+        if isinstance(stack, str):
+            skills.append(stack)
+        elif isinstance(stack, list):
+            skills.extend(str(x) for x in stack if x)
+        for t in item.get("tags") or []:
+            if isinstance(t, dict):
+                name = t.get("name")
+                if name:
+                    skills.append(str(name))
+            elif t:
+                skills.append(str(t))
+
+        blob = " ".join(x for x in [title, company, " ".join(skills), tldr] if x)
+
+        # порядок — как у полных фильтров ниже: не-удалёнка → не-крипта → индустрия
+        if feed.key in ("remote", "global", "crypto_remote") and self.cfg.remote_strict \
+                and NON_REMOTE_RE.search(wf_s):
+            return "skipped_not_remote"
+        if feed.key == "crypto" and self.cfg.crypto_strict and not CRYPTO_RE.search(blob):
+            return "skipped_not_crypto"
+        if self.cfg.industry_strict and not (INDUSTRY_RE.search(blob) or CRYPTO_RE.search(blob)):
+            return "skipped_off_industry"
+        return None
+
+    def _auth_quota_block(self) -> Optional[str]:
+        """Лимит запросов от имени аккаунта исчерпан? Причина или None.
+
+        Часовое окно — в памяти (скользящее), суточное — в БД с датой по МСК:
+        раны замещают друг друга каждые ~5.5 ч, счётчик должен переживать.
+        """
+        now = time.time()
+        self._auth_hour_ts = [t for t in self._auth_hour_ts if now - t < 3600.0]
+        hour_max = max(1, self.cfg.auth_views_hour_max)
+        if len(self._auth_hour_ts) >= hour_max:
+            return f"часовой лимит просмотров {hour_max} исчерпан"
+        today = self._today_msk()
+        if today != self._auth_day_date:  # новые сутки — новый счётчик
+            self._auth_day_date = today
+            self._auth_day = 0
+            self.db.set_setting("auth_views_date", today)
+            self.db.set_setting("auth_views_count", "0")
+        day_max = max(1, self.cfg.auth_views_day_max)
+        if self._auth_day >= day_max:
+            return f"суточный лимит просмотров {day_max} исчерпан"
+        return None
+
+    def _auth_view_spent(self) -> None:
+        """Учесть один «дорогой» запрос от имени аккаунта (вакансия/контакты)."""
+        self._auth_hour_ts.append(time.time())
+        self._auth_day += 1
+        self.db.set_setting("auth_views_count", str(self._auth_day))
 
     def _load_ts(self, key: str) -> float:
         """Число из settings (пусто/мусор → 0): пауза автоматизации живёт в БД."""
@@ -510,27 +635,46 @@ class Monitor:
         minutes = AUTOMATION_BACKOFF_MIN[min(count - 1, len(AUTOMATION_BACKOFF_MIN) - 1)]
         self._automation_flag_count = count
         self._automation_until = time.time() + minutes * 60
+        self._automation_last_flag = time.time()
         self.db.set_setting("automation_until", str(int(self._automation_until)))
         self.db.set_setting("automation_flags", str(count))
+        self.db.set_setting("automation_last_flag", str(int(self._automation_last_flag)))
         log.warning("Сайт заподозрил автоматизацию (срабатывание №%d) — пауза %d мин: %s",
                     count, minutes, e)
         self._warn_automation([s["chat_id"] for s in subscribers[:1]], minutes)
         return minutes
 
-    def _automation_healed(self, subscribers: list[dict]) -> None:
-        """Первый успешный полный просмотр после флага — сайт снял ограничение."""
+    def _automation_healed(self, subscribers: list[dict], announce: bool = False) -> None:
+        """Успешный полный просмотр после флага — сайт снял ограничение.
+
+        Счётчик эскалации сбрасываем ТОЛЬКО если с последнего флага прошло
+        больше AUTOMATION_FLAG_MEMORY_SEC (48 ч): иначе сайт, снимающий флаг
+        на пару часов и флажащий снова, каждый раз получал бы минимальную
+        паузу 90 мин — лестница эскалации не работала бы вовсе. Пока счётчик
+        держится, каждый следующий флаг сразу бьёт ступенью выше.
+        Сообщение «сняли флаг» — только при announce (свежеистёкшая пауза),
+        чтобы не спамить при каждом успешном просмотре.
+        """
         if not self._automation_flag_count:
             return
-        self._automation_flag_count = 0
+        elapsed = time.time() - self._automation_last_flag
         self._automation_until = 0.0
         self.db.set_setting("automation_until", "0")
-        self.db.set_setting("automation_flags", "0")
-        log.info("Флаг автоматизации снят сайтом — работаем в обычном режиме")
-        from . import texts
+        if elapsed >= AUTOMATION_FLAG_MEMORY_SEC:
+            self._automation_flag_count = 0
+            self.db.set_setting("automation_flags", "0")
+            log.info("Флаг автоматизации снят сайтом (тишина %.1f ч) — сброс счётчика эскалации",
+                     elapsed / 3600)
+        else:
+            log.info("Флаг автоматизации снят сайтом, но сработал %.1f ч назад — счётчик "
+                     "эскалации (%d) держу до 48 ч тишины", elapsed / 3600,
+                     self._automation_flag_count)
+        if announce:
+            from . import texts
 
-        self._fire_and_forget_text(
-            [s["chat_id"] for s in subscribers[:1]], texts.AUTOMATION_LIFTED,
-        )
+            self._fire_and_forget_text(
+                [s["chat_id"] for s in subscribers[:1]], texts.AUTOMATION_LIFTED,
+            )
 
     def _warn_cookie(self, recipients: list[int]) -> None:
         """Одно напоминание в 6 часов, если контакты выглядят скрытыми."""

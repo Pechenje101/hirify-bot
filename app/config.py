@@ -133,10 +133,33 @@ class Config:
     # гемблинга / беттинга, дейтинга, high-risk- и NDA-проектов, крипты и смежных
     # (признаки — INDUSTRY_RE в parsing.py). Обычные компании отсеиваются.
     industry_strict: bool = field(default_factory=lambda: _get_bool("INDUSTRY_STRICT", True))
+    # Дешёвый префильтр по элементу фида (title+tldr+company+стек, БЕЗ
+    # открытия вакансии): вакансии мимо целевых индустрий не открываем вовсе —
+    # именно «просмотры» аккаунта сайт считает и за них флажит автоматизацию.
+    # Элементы без title/tldr всё равно открываем (нечем судить).
+    feed_prefilter: bool = field(default_factory=lambda: _get_bool("FEED_PREFILTER", True))
+    # Квоты на запросы ОТ ИМЕНИ АККАУНТА (данные вакансии + контакты): лимит
+    # в час и в сутки. Превышение — остальные вакансии откладываются до
+    # следующего прохода (не теряются: фид анонимный, ретрай бесплатный).
+    # Аккаунт, просматривающий десятки вакансий подряд из IP датацентра —
+    # классический триггер automation_detected.
+    auth_views_hour_max: int = field(default_factory=lambda: _get_int("AUTH_VIEWS_HOUR_MAX", 12))
+    auth_views_day_max: int = field(default_factory=lambda: _get_int("AUTH_VIEWS_DAY_MAX", 80))
 
-    # Пауза между загрузками страниц вакансий, сек (вежливость к сайту)
+    # Пауза между загрузками страниц фида, сек (вежливость к сайту).
+    # Паузы «человеческого» темпа для дорогих запросов (диапазоны «lo,hi»,
+    # сек): вакансию человек читает десяток секунд, контакты открывает
+    # не мгновенно. Ровные 1.5 с между открытиями вакансий — метроном,
+    # каким джоб-борды люди не листают.
     fetch_delay_sec: float = field(default_factory=lambda: _get_float("FETCH_DELAY_SEC", 1.5))
+    vacancy_gap_sec: str = field(default_factory=lambda: os.getenv("VACANCY_GAP_SEC", "6,14"))
+    contacts_gap_sec: str = field(default_factory=lambda: os.getenv("CONTACTS_GAP_SEC", "4,9"))
     request_timeout_sec: float = field(default_factory=lambda: _get_float("REQUEST_TIMEOUT_SEC", 30.0))
+    # Двигатель запросов: curl_cffi с имперсонацией Chrome — настоящий
+    # TLS-отпечаток (JA3) и HTTP/2, как у браузера, вместо «питоновского»
+    # TLS у httpx. Цель имперсонации: chrome (последняя известная библиотеке)
+    # или конкретная — chrome142, safari17_0 и т.д.
+    impersonate_target: str = field(default_factory=lambda: os.getenv("IMPERSONATE_TARGET", "chrome"))
 
     # --- Мониторинг ---
     # Базовый интервал проверки фида, минут. Держим небольшим: карточка должна
