@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 
 from .db import Database
@@ -26,6 +27,14 @@ MAX_SEND_ATTEMPTS = 10               # потолок ретраев доста�
 # Живёт пауза в БД: раны замещают друг друга — в памяти она бы терялась, и
 # каждый новый ран снова дёргал бы закрытый API через минуту после старта.
 AUTOMATION_BACKOFF_MIN = (90, 240, 480, 960, 1440)   # мин, с эскалацией
+# Пока сайт держит флаг, фиды тоже не дёргаем каждые 5 мин: раз в 30 мин
+# хватит (бэклог копится и так), зато ограниченный аккаунт не палится
+# непрерывным поллингом — возможно, каждая попытка продлевает ограничение.
+# К концу паузы просыпаемся точно, чтобы сразу добрать накопленное.
+AUTOMATION_POLL_SEC = 30 * 60
+# Джиттер интервала опроса: «ровно каждые N минут» — классическая подпись
+# бота; человек ходит по сайту неровно. X0.8–1.35 от базового интервала.
+POLL_JITTER = (0.8, 1.35)
 
 
 class Monitor:
@@ -94,6 +103,22 @@ class Monitor:
             return self.cfg.fast_poll_sec  # было движение — вдруг появилось ещё
         return self.cfg.poll_minutes * 60
 
+    def _post_poll_wait(self, stats: dict) -> float:
+        """Интервал сна после прохода — с «человеческим» джиттером.
+
+        Ровный метроном «раз в N минут, круглые сутки» — верный способ
+        получить флаг automation_detected: так не browse'ит ни один человек.
+        Поэтому базовый интервал гуляет (×0.8–1.35). А пока сайт держит
+        флаг автоматизации — переворачиваем фиды редко (раз в 30 мин) и
+        просыпаемся точно к концу паузы.
+        """
+        if stats.get("automation_pause"):
+            left = self.automation_left_sec
+            if left > 0:
+                return min(AUTOMATION_POLL_SEC, left + 30.0)
+        base = self.next_interval(stats)
+        return max(60.0, base * random.uniform(*POLL_JITTER))
+
     async def _sleep(self, seconds: float) -> None:
         """Сон, который можно прервать: /resume, /start (nudge) или stop()."""
         try:
@@ -124,7 +149,7 @@ class Monitor:
             if not self.paused:
                 try:
                     stats = await self.poll_once(source="auto")
-                    wait = self.next_interval(stats)
+                    wait = self._post_poll_wait(stats)
                 except Exception:  # noqa: BLE001
                     log.exception("Цикл мониторинга упал с ошибкой")
             await self._sleep(wait)

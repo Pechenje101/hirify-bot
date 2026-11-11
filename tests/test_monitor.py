@@ -548,3 +548,43 @@ def test_off_industry_job_never_requests_contacts():
     assert spy.contact_fetches == ["101-senior-solidity-engineer"]
     assert db.job_status(102) == "skipped_off_industry"
     db.close()
+
+
+# --------------------------------------------------- ритм опроса (анти-флаг)
+
+def test_poll_wait_has_human_jitter():
+    """Пустой проход → интервал базовый, но НЕ ровный: гуляет ×0.8–1.35,
+    минимум 60 с — метроном «раз в 5.00 минут» выдаёт автоматизацию."""
+    from app.monitor import POLL_JITTER
+
+    mon, _, _, db = make_monitor()
+    base = mon.cfg.poll_minutes * 60
+    waits = {round(mon._post_poll_wait({"total": 0, "sent": 0})) for _ in range(60)}
+    assert all(base * POLL_JITTER[0] - 1 <= w <= base * POLL_JITTER[1] + 1 for w in waits)
+    assert len(waits) > 5, "интервал не гуляет — метроном остался"
+    # было движение — быстрый повтор тоже с джиттером, но не короче минуты
+    fast = {round(mon._post_poll_wait({"total": 1, "sent": 1})) for _ in range(40)}
+    fbase = mon.cfg.fast_poll_sec
+    assert all(fbase * POLL_JITTER[0] - 1 <= w <= fbase * POLL_JITTER[1] + 1 for w in fast)
+    db.close()
+
+
+def test_poll_wait_slow_and_wake_at_pause_end():
+    """Пока сайт держит флаг автоматизации: фиды дёргаем редко (раз в 30 мин),
+    но к концу паузы просыпаемся точно (±секунды) — сразу добрать бэклог."""
+    from app.monitor import AUTOMATION_POLL_SEC, POLL_JITTER
+
+    mon, _, _, db = make_monitor()
+    # флаг свежий: паузы ещё полтора часа → спим максимум 30 мин
+    mon._automation_until = time.time() + 90 * 60
+    w = mon._post_poll_wait({"automation_pause": True, "total": 0, "sent": 0})
+    assert AUTOMATION_POLL_SEC - 1 <= w <= AUTOMATION_POLL_SEC  # min(1800, ~5430)
+    # пауза вот-вот кончится → будим почти сразу, не спим полчаса
+    mon._automation_until = time.time() + 40
+    w2 = mon._post_poll_wait({"automation_pause": True, "total": 0, "sent": 0})
+    assert 40 <= w2 <= 70
+    # флага нет — обычный джиттер-режим (не 30 минут!)
+    mon._automation_until = 0.0
+    w3 = mon._post_poll_wait({"total": 0, "sent": 0})
+    assert w3 <= mon.cfg.poll_minutes * 60 * POLL_JITTER[1]
+    db.close()
