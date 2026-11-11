@@ -22,5 +22,5 @@ jobs:
 
       - name: Проба ТГ-каналов (t.me/s, анонимно)
         env:
-          TG_CHANNELS: 'cpa_people,opento_igaming,payments_lenkep,IT_iGaming'
+          TG_CHANNELS: 'cpa_people,opento_igaming,payments_lenkep,IT_iGaming,betting_job'
         run: python tools/probe_channels.py

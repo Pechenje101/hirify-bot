@@ -161,6 +161,7 @@ def test_config_env(monkeypatch=None):
     os.environ["USE_WIDGET"] = "0"
     os.environ["HIRIFY_FEEDS"] = "crypto,global"
     os.environ["REMOTE_STRICT"] = "0"
+    os.environ["INDUSTRY_STRICT_TG"] = "1"
     os.environ["TG_CHANNELS"] = "cpa_people,https://t.me/s/payments_lenkep"
     from app.config import Config as C
     cfg = C()
@@ -174,8 +175,10 @@ def test_config_env(monkeypatch=None):
                                           "tg_cpa_people", "tg_payments_lenkep"]
     assert cfg.feeds[2].source == "tg" and cfg.feeds[2].channel == "cpa_people"
     assert cfg.remote_strict is False and cfg.crypto_strict is True
+    assert cfg.industry_strict_tg is True
     for k in ("HIRIFY_FEED_PARAMS", "POLL_MINUTES", "FAST_POLL_SEC", "USE_RICH",
-              "USE_WIDGET", "HIRIFY_FEEDS", "REMOTE_STRICT", "TG_CHANNELS"):
+              "USE_WIDGET", "HIRIFY_FEEDS", "REMOTE_STRICT", "INDUSTRY_STRICT_TG",
+              "TG_CHANNELS"):
         os.environ.pop(k, None)
 
 

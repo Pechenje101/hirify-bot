@@ -1116,11 +1116,31 @@ def test_channel_industry_filter_applies():
         "Резюме: @agro_hr, работа на месте."
     )
     posts = {"cpa_people": [_ch_item(1401, text, _iso(now - timedelta(minutes=5)))]}
-    mon, _, _, db = _make_channel_monitor(posts)
-    mon.cfg.industry_strict = True   # боевое значение
+    mon, _, sender, db = _make_channel_monitor(posts)
+    mon.cfg.industry_strict_tg = True   # флаг каналов включён принудительно
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["filtered"] == 1 and stats["sent"] == 0
     assert db.job_status(channel_job_id("cpa_people", 1401)) == "skipped_off_industry"
+    db.close()
+
+
+def test_channel_industry_filter_off_by_default():
+    """INDUSTRY_STRICT_TG выключен по умолчанию: канал уже вертикально
+    курируемый, общий INDUSTRY_RE поверх его постов не работает.
+    Пост мимо INDUSTRY_RE (пейменты/CPA без «гемблинг»-слов) доставляется."""
+    now = datetime.now(timezone.utc)
+    text = (
+        "Оператор теплицы (агрокомплекс)\n"
+        "Зарплата 40 000 ₽/мес, опыт от 1 года.\n"
+        "Резюме: @agro_hr, работа на месте."
+    )
+    posts = {"cpa_people": [_ch_item(1402, text, _iso(now - timedelta(minutes=5)))]}
+    mon, _, sender, db = _make_channel_monitor(posts)
+    assert mon.cfg.industry_strict_tg is False   # дефолт
+    assert mon.cfg.industry_strict is False      # в тестовой фикстуре выключен — флаги независимы
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["filtered"] == 0
+    assert db.job_status(channel_job_id("cpa_people", 1402)) == "sent"
     db.close()
 
 

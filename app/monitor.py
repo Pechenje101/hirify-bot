@@ -569,8 +569,9 @@ class Monitor:
             tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
         )
 
-        # тот же индустриальный фильтр, что для вакансий hirify
-        if self.cfg.industry_strict and not v.is_target_industry:
+        # индустриальный фильтр каналов — отдельный выключатель (по умолчанию
+        # выключен: канал уже вертикально курируемый, см. config.INDUSTRY_STRICT_TG)
+        if self.cfg.industry_strict_tg and not v.is_target_industry:
             self.db.mark_job(job_id, "skipped_off_industry")
             stats["filtered"] += 1
             log.debug("post %d: целевых индустрий нет — пропускаю", job_id)
