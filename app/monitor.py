@@ -67,6 +67,15 @@ class Monitor:
         self._automation_until = self._load_ts("automation_until")
         self._automation_flag_count = int(self._load_ts("automation_flags"))
         self._automation_last_flag = self._load_ts("automation_last_flag")
+        # legacy-БД (до ревизии с памятью эскалации) не хранила время флага:
+        # прикидываем его по паузе (until ≈ момент флага + ступень(count)).
+        # Лучше считать флаг «недавним», чем «давним» — лестница эскалации
+        # при повторах не должна скатываться к минимуму из-за старой БД.
+        if self._automation_flag_count and not self._automation_last_flag and self._automation_until:
+            step = AUTOMATION_BACKOFF_MIN[
+                min(self._automation_flag_count - 1, len(AUTOMATION_BACKOFF_MIN) - 1)]
+            self._automation_last_flag = max(0.0, self._automation_until - step * 60)
+            self.db.set_setting("automation_last_flag", str(int(self._automation_last_flag)))
         # квоты запросов от имени аккаунта: час — в памяти, сутки — в БД
         # (переживают замещение ранов, как и пауза автоматизации)
         self._auth_hour_ts: list[float] = []

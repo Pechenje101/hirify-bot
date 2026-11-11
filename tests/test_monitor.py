@@ -875,3 +875,26 @@ def test_auth_day_quota_persists_in_db():
     assert stats["quota_deferred"] >= 1
     assert db.job_status(102) is None
     db.close()
+
+
+def test_automation_last_flag_derived_from_legacy_db():
+    """БД без automation_last_flag (до ревизии памяти эскалации): время флага
+    выводим из паузы (until - ступень), чтобы счётчик не сбрасывался зря."""
+    tmpdir = tempfile.mkdtemp(prefix="hirify_test_")
+    db = Database(Path(tmpdir) / "t.db")
+    db.add_subscriber(1, "@tester")
+    db.set_setting("automation_flags", "2")
+    until = time.time() + 3 * 3600
+    db.set_setting("automation_until", str(int(until)))   # без last_flag — legacy
+
+    cfg = Config(bot_token="x")
+    cfg.auth_views_hour_max = 10**9
+    cfg.auth_views_day_max = 10**9
+    mon = Monitor(FakeClient(FEED_ITEMS, VACANCIES), db, FakeSender(), cfg)
+    # count=2 → ступень 240 мин → флаг «был» ~4 ч назад (не 48+)
+    assert 3.5 * 3600 < until - mon._automation_last_flag <= 4.1 * 3600
+    assert db.get_setting("automation_last_flag", "") != ""  # выведенное сохранено
+    # и heal НЕ сбросит счётчик (флаг «недавний»)
+    mon._automation_healed([{"chat_id": 1}])
+    assert mon._automation_flag_count == 2
+    db.close()
