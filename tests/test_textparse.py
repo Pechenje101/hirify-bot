@@ -170,3 +170,50 @@ def test_card_texts_format_clean():
                                   contact="K", display="D")
     assert "{" not in s and "}" not in s
     assert "<code>" in texts.CARD_HINT
+
+
+# ---------------------------------------------------------------- авто-детект
+# looks_like_vacancy решает, собирать ли авто-карточку из сообщения без
+# команды: вставил описание → бот сам показал его во всех видах.
+
+from app.textparse import looks_like_vacancy  # noqa: E402
+
+PLAIN_VACANCY = (
+    "Продуктовый дизайнер | Neobank\n"
+    "Удалённо, полная занятость.\n"
+    "Зарплата: 250 000 руб.\n"
+    "Обязанности: дизайн мобильных интерфейсов, работа с дизайн-системой.\n"
+    "Опыт от 2 лет. Стек: Figma, дизайн-системы."
+)
+
+
+def test_autodetect_real_vacancies():
+    # «эталонный» образец из тестов парсера
+    assert looks_like_vacancy(SAMPLE)
+    # без TG-контакта: зарплата(2) + должность(1) + маркеры(зарплата/обязанности)(1)
+    assert looks_like_vacancy(PLAIN_VACANCY)
+
+
+def test_autodetect_ignores_smalltalk():
+    assert not looks_like_vacancy("")                       # пусто
+    assert not looks_like_vacancy("Привет! Как дела?")      # короткий разговор
+    assert not looks_like_vacancy("Спасибо, всё работает!")  # короткая радость
+
+
+def test_autodetect_ignores_long_non_vacancy():
+    # длинная жалоба без маяков вакансии — бот обязан промолчать
+    complaint = ("Я очень недоволен работой поддержки: обращался трижды, каждый раз "
+                "обещали перезвонить и не перезвонили, пришлось писать повторно, "
+                "вопрос так и не решился до конца, время ушло, сил нет.")
+    assert not looks_like_vacancy(complaint)
+
+
+def test_autodetect_ignores_cookie_and_seeker():
+    # вставленная строка cookie (админ мог прислать без команды)
+    cookie = ("hirifyme_session=eyJp9cHJvZHNhbGXTaG9FpZHU=" + "a" * 200 +
+              "; remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d=" + "b" * 100)
+    assert not looks_like_vacancy(cookie)
+    # соискатель описывает СЕБЯ — это не вакансия, карточку собирать нельзя
+    seeker = ("Привет! Ищу работу middle Python разработчиком, удалённо, "
+              "опыт 4 года, стек Django/FastAPI, готов обсудить вакансии.")
+    assert not looks_like_vacancy(seeker)

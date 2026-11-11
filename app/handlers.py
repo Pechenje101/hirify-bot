@@ -15,7 +15,7 @@ from .config import Feed
 from .db import DEFAULT_DISPLAY, DISPLAY_MODES
 from .monitor import POLL_JITTER
 from .services import Services
-from .textparse import parse_vacancy_text
+from .textparse import looks_like_vacancy, parse_vacancy_text
 
 log = logging.getLogger("hirify.handlers")
 
@@ -32,6 +32,13 @@ DISPLAY_LABELS: dict[str, str] = {
     "auto": "🤖 Авто",
 }
 DISPLAY_ORDER = ("bubble", "rich", "classic", "auto")
+
+# Авто-карточка из своего текста: без команды /card — просто прислать текст
+# (или файл .txt/.md). Текст сообщения ≤ 4000, файл — до 512 КБ / 8000 символов:
+# больше файла — точно не описание вакансии, а вырезать «середину» нельзя.
+AUTOCARD_TEXT_MAX = 8000
+AUTOCARD_DOC_MAX_BYTES = 512 * 1024
+_DOC_EXTS = (".txt", ".md", ".markdown", ".text")
 
 
 # ---------------------------------------------------------------- вспомог.
@@ -156,14 +163,54 @@ async def cmd_test(message: Message, services: Services):
     )
 
 
+async def _card_summary(message: Message, v) -> None:
+    """Короткая сводка распознанного — сразу видно качество разбора."""
+    await message.answer(
+        texts.CARD_SUMMARY.format(
+            title=html_mod.escape(v.title or "—"),
+            company=html_mod.escape(v.company) if v.company else "—",
+            salary=html_mod.escape(v.salary) if v.salary else "не распознана",
+            contact=(html_mod.escape(v.primary_contact.display)
+                     if v.primary_contact else "не найден"),
+        ),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _send_all_formats(chat_id: int, v, services: Services) -> None:
+    """Карточка во всех наших видах подряд (Пузырь → Rich → Классика).
+
+    Это разовый рендер «на посмотреть»: вид из /settings тут не важен. Перед
+    каждой карточкой — метка с номером, а если выбранный вид в этом чате не
+    поддерживается — честная приписка, чем заменили (send_vacancy фолбэчит
+    сам и возвращает фактический вид).
+    """
+    modes = ("bubble", "rich", "classic")
+    for i, mode in enumerate(modes, start=1):
+        label = texts.DISPLAY_LABELS_RU.get(mode, mode)
+        await services.sender.send_text(chat_id, f"<b>{i}/{len(modes)}</b> · {label}")
+        try:
+            sent_with = await services.sender.send_vacancy(chat_id, v, display=mode, silent=True)
+        except Exception as e:  # noqa: BLE001 — вид не доставился вовсе: остальное покажем
+            log.warning("Авто-карточка: вид %s не доставлен: %s", mode, e)
+            continue
+        if sent_with != mode:
+            got = texts.DISPLAY_LABELS_RU.get(sent_with, sent_with)
+            await services.sender.send_text(
+                chat_id, texts.AUTOCARD_FELLBACK.format(asked=label, got=got))
+
+
 @router.message(Command("card"))
 async def cmd_card(message: Message, command: CommandObject, services: Services):
-    """Карточка из СВОЕГО текста вакансии: /card <текст>.
+    """Карточка из СВОЕГО текста вакансии: /card <текст> — во всех наших видах.
 
     Парсер распознаёт заголовок/компанию/зарплату/формат/грейд/скиллы/контакты
-    (app/textparse.py), дальше карточка идёт обычным путём — тем видом,
-    который выбран в /settings. В БД мониторинга ничего не пишется: это
-    разовый рендер, а не вакансия из фида.
+    (app/textparse.py), дальше карточка идёт тремя видами подряд (Пузырь,
+    Rich, классика) — удобно выбрать, какой нравится (в /settings — для
+    рассылки). В БД мониторинга ничего не пишется: это разовый рендер.
+    То же самое бот делает сам, если просто прислать текст вакансии
+    сообщением или файлом .txt/.md (см. fallback/on_document ниже).
     """
     if not await _ensure_private(message):
         return
@@ -176,22 +223,8 @@ async def cmd_card(message: Message, command: CommandObject, services: Services)
     # запас; длиннее пользовательским текстом всё равно не прислать
     raw = raw[:4000]
     v = parse_vacancy_text(raw)
-    sub = services.db.subscriber(message.chat.id)
-    display = sub["display"] if sub else DEFAULT_DISPLAY
-    # короткая сводка, что распозналось — сразу видно качество разбора
-    await message.answer(
-        texts.CARD_SUMMARY.format(
-            title=html_mod.escape(v.title or "—"),
-            company=html_mod.escape(v.company) if v.company else "—",
-            salary=html_mod.escape(v.salary) if v.salary else "не распознана",
-            contact=(html_mod.escape(v.primary_contact.display)
-                     if v.primary_contact else "не найден"),
-            display=DISPLAY_LABELS.get(display, display),
-        ),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await services.sender.send_vacancy(message.chat.id, v, display=display)
+    await _card_summary(message, v)
+    await _send_all_formats(message.chat.id, v, services)
 
 
 @router.message(Command("fresh"))
@@ -420,16 +453,68 @@ async def cmd_setcookie(message: Message, command: CommandObject, services: Serv
         await message.answer(texts.COOKIE_SET)
 
 
-@router.message()
-async def fallback(message: Message):
-    """Любое другое сообщение — подсказка. В группах МОЛЧИМ: бот, добавленный
-    в группу, не должен отвечать на каждое сообщение чата (спам)."""
+def _decode_doc(b: bytes) -> str:
+    """Текст файла: utf-8 (с BOM), иначе cp1251, иначе замены символов."""
+    for enc in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", "replace")
+
+
+@router.message(F.document)
+async def on_document(message: Message, services: Services):
+    """Загруженное описание вакансии: файл .txt/.md → карточка во всех видах.
+
+    «Загрузить описание» — буквально: не надо ничего копировать в сообщение.
+    Только личка (в группах молчим), только текстовые файлы (картинки/PDF
+    бот не читает), до 512 КБ. Дальше — тот же конвейер, что у вставленного
+    текста: детект «похоже на вакансию» → сводка → три вида карточки.
+    """
     if message.chat.type != "private":
         return
-    await message.answer(
-        "🤖 Я понимаю только команды. Список — /help, проверить вакансии — /fresh, "
-        "настроить рассылку — /settings.",
+    doc = message.document
+    name = (doc.file_name or "").lower() if doc else ""
+    mime = (doc.mime_type or "") if doc else ""
+    is_text_doc = bool(doc) and (
+        name.endswith(_DOC_EXTS) or mime.startswith("text/") or not name
     )
+    if not is_text_doc or (doc.file_size or 0) > AUTOCARD_DOC_MAX_BYTES:
+        await message.answer(texts.DOC_HINT, parse_mode="HTML",
+                             disable_web_page_preview=True)
+        return
+    data = await message.bot.download(doc)
+    if data is None:
+        await message.answer(texts.DOC_HINT, parse_mode="HTML",
+                             disable_web_page_preview=True)
+        return
+    raw_bytes = data.getvalue() if hasattr(data, "getvalue") else bytes(data)
+    raw = _decode_doc(raw_bytes)[:AUTOCARD_TEXT_MAX]
+    if not looks_like_vacancy(raw):
+        # файл прочитан, но вакансии в нём не видно — объясняем, что распознаём
+        await message.answer(texts.CARD_HINT, parse_mode="HTML",
+                             disable_web_page_preview=True)
+        return
+    v = parse_vacancy_text(raw)
+    await _card_summary(message, v)
+    await _send_all_formats(message.chat.id, v, services)
+
+
+@router.message()
+async def fallback(message: Message, services: Services):
+    """Все прочие сообщения: в личке — авто-карточка, если текст похож на
+    вакансию (вставил описание без команды — бот соберёт карточку сам),
+    иначе подсказка. В группах МОЛЧИМ: бот, добавленный в группу, не должен
+    отвечать на каждое сообщение чата (спам)."""
+    if message.chat.type != "private":
+        return
+    if message.text and looks_like_vacancy(message.text):
+        v = parse_vacancy_text(message.text[:4000])
+        await _card_summary(message, v)
+        await _send_all_formats(message.chat.id, v, services)
+        return
+    await message.answer(texts.FALLBACK_HINT, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------- ошибки

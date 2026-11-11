@@ -442,3 +442,64 @@ def parse_vacancy_text(text: str) -> Vacancy:
         feed_key="manual",
         feed_label="✍️ из вашего текста",
     )
+
+
+# ---------------------------------------------------------------- авто-детект
+
+# Текст вакансии отличается от обычной болтовни: должность, деньги, контакт,
+# требования. Голая длина — не признак (жалоба бывает длинной), поэтому
+# считаем «маяки» и требуем минимум три. Весомые (зарплата, TG-контакт)
+# дают по 2: их у живых вакансий почти всегда хватает.
+_ROLE_WORDS = re.compile(
+    r"(?i)\b(?:"
+    r"engineer|developer|manager|designer|analyst|architect|consultant|"
+    r"specialist|administrator|coordinator|recruiter|mentor|"
+    r"qa|devops|sre|intern|junior|middle|senior|lead|principal|"
+    r"инженер|разработчик|менеджер|дизайнер|аналитик|архитектор|специалист|"
+    r"администратор|координатор|консультант|наставник|рекрутер|директор|"
+    r"руководитель|должность|вакан(?:сия|ции)|position|vacancy|hiring"
+    r")\b"
+)
+_FORMAT_WORDS = re.compile(
+    r"(?i)(удал[её]нн|гибрид|офис|remote|hybrid|onsite|on-site|work\s+from\s+anywhere)"
+)
+_LABEL_WORDS = re.compile(
+    r"(?i)(должность|position|компани[ия]|company|зарплата|salary|вилка|зп\b|"
+    r"доход|опыт\s|experience|стек|stack|навыки|обязанности|требования|условия|"
+    r"оформление|график|занятость)"
+)
+# Соискатель описывает СЕБЯ, а не вакансию: «ищу работу», «моё резюме» —
+# не карточка, а просьба. Срабатывание на такое — главный ложный сигнал.
+_SEEKER_WORDS = re.compile(
+    r"(?i)\b(?:ищу\s+(?:работу|вакансию|проект)|резюме|cv\b|resume|"
+    r"рассматриваю\s+(?:вакансии|предложения)|open\s+to\s+work)\b"
+)
+AUTOCARD_MIN_CHARS = 80  # короче 80 символов вакансию не описывают
+
+
+def looks_like_vacancy(text: str) -> bool:
+    """Похоже ли сообщение на описание вакансии — для авто-карточки без команды.
+
+    Консервативно: лучше промолчать на спорном тексте (юзер позовёт /card),
+    чем собирать «карточку» из жалобы или привета. Порог — 3 маяка, из них
+    зарплата и Telegram-контакт весят по 2.
+    """
+    if not text:
+        return False
+    body = text.strip()
+    if len(body) < AUTOCARD_MIN_CHARS:
+        return False
+    if _SEEKER_WORDS.search(body):
+        return False
+    score = 0
+    if parse_salary(body):
+        score += 2
+    if MENTION_RE.search(body) or TELEGRAM_LINK_RE.search(body):
+        score += 2
+    if _ROLE_WORDS.search(body):
+        score += 1
+    if _FORMAT_WORDS.search(body):
+        score += 1
+    if _LABEL_WORDS.search(body):
+        score += 1
+    return score >= 3
