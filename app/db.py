@@ -149,6 +149,17 @@ class Database:
             row = self.conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return row["status"] if row else None
 
+    def get_job(self, job_id: int) -> dict | None:
+        """Вся строка вакансии (slug/url/title/tg_contacts/…) — для кнопки
+        «Показать контакты»: контакт материализуется в tg_contacts и кэшируется."""
+        with _LOCK:
+            row = self.conn.execute(
+                "SELECT job_id, slug, url, title, company, salary, tg_contacts,"
+                " attempts, first_seen, sent_at, status FROM jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def add_job(
         self,
         job_id: int,

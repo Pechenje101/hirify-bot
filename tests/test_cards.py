@@ -366,3 +366,29 @@ def test_keyboard_main_button_is_primary_style():
     copy_btn = next(b for b in flat if "Копировать" in (b.text or ""))
     assert write_btn.style == "primary"
     assert not copy_btn.style  # дефолтный стиль приложения
+
+
+def test_keyboard_contacts_by_button_fallback():
+    """Кнопочный режим (контакта нет): единственная кнопка — «Показать
+    контакты» с callback cnt:<job_id> (контакт даст 1 auth-запрос по нажатию)."""
+    from app.parsing import Vacancy
+
+    v = Vacancy(job_id=777, slug="x", url="https://hirify.me/jobs/777-x")
+    v.contacts_by_button = True
+    kb = inline_keyboard(v)
+    flat = [b for row in kb.inline_keyboard for b in row]
+    assert len(flat) == 1
+    btn = flat[0]
+    assert "Показать контакты" in (btn.text or "")
+    assert btn.callback_data == "cnt:777"
+    assert btn.url is None and btn.copy_text is None
+
+
+def test_keyboard_no_button_for_autocard_without_contacts():
+    """Обычная вакансия без контактов (НЕ кнопочный режим — например,
+    автокарточка из своего текста): кнопки не появляется вовсе."""
+    from app.parsing import Vacancy
+
+    v = Vacancy(job_id=1, slug="x", url="https://hirify.me/jobs/1-x")
+    kb = inline_keyboard(v)
+    assert not kb.inline_keyboard

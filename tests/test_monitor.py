@@ -73,6 +73,7 @@ class FakeClient:
         self.api = api
         self.feed_fetches = 0
         self.job_fetches = 0
+        self.contacts_fetches = 0
         self.landing_fetches = 0
         self.landing_html: dict[str, str] = {}   # slug → HTML публичной страницы
 
@@ -85,6 +86,7 @@ class FakeClient:
         return self.api[slug][0]
 
     async def fetch_contacts(self, slug: str) -> dict:
+        self.contacts_fetches += 1
         return self.api[slug][1]
 
     async def fetch_job(self, url: str) -> str:
@@ -100,6 +102,7 @@ class FakeClient:
 class FakeSender:
     def __init__(self):
         self.sent: list[tuple[int, str]] = []
+        self.vacancies: list[Vacancy] = []
         self.silents: list[bool] = []
         self.displays: list[str] = []
         self.texts: list[str] = []
@@ -108,6 +111,7 @@ class FakeSender:
         self, chat_id: int, v: Vacancy, *, silent: bool = False, display: str = "auto"
     ) -> str:
         self.sent.append((chat_id, v.title))
+        self.vacancies.append(v)
         self.silents.append(silent)
         self.displays.append(display)
         return "classic"
@@ -123,6 +127,9 @@ def make_monitor(monkeypatch_feeds: str = "remote") -> tuple[Monitor, FakeClient
     cfg.remote_strict = False
     cfg.crypto_strict = False
     cfg.industry_strict = False  # по умолчанию включён; в базовых тестах выключен
+    # ЛЕГАСИ-режим: старые тесты описывают авто-путь (данные+контакты сам);
+    # кнопочный режим (теперь дефолт) покрыт отдельными тестами ниже
+    cfg.contacts_mode = "auto"
     # квоты аккаунта не должны мешать базовым тестам (много проходов подряд)
     cfg.auth_views_hour_max = 10**9
     cfg.auth_views_day_max = 10**9
@@ -584,6 +591,7 @@ def test_poll_wait_has_human_jitter():
     from app.monitor import POLL_JITTER
 
     mon, _, _, db = make_monitor()
+    mon._night_slowdown = lambda: 1.0   # тест не зависит от часа запуска (ночью ×3)
     base = mon.cfg.poll_minutes * 60
     waits = {round(mon._post_poll_wait({"total": 0, "sent": 0})) for _ in range(60)}
     assert all(base * POLL_JITTER[0] - 1 <= w <= base * POLL_JITTER[1] + 1 for w in waits)
@@ -601,6 +609,7 @@ def test_poll_wait_slow_and_wake_at_pause_end():
     from app.monitor import AUTOMATION_POLL_SEC, POLL_JITTER
 
     mon, _, _, db = make_monitor()
+    mon._night_slowdown = lambda: 1.0   # тест не зависит от часа запуска (ночью ×3)
     # флаг свежий: паузы ещё полтора часа → спим максимум 30 мин
     mon._automation_until = time.time() + 90 * 60
     w = mon._post_poll_wait({"automation_pause": True, "total": 0, "sent": 0})
@@ -1263,4 +1272,101 @@ def test_channel_recipient_feed_selection():
     stats = asyncio.run(mon.poll_once(source="test"))
     assert stats["no_audience"] == 1 and sender.sent == []
     assert db.job_status(channel_job_id("cpa_people", 1234)) == "sent"  # финализировано
+    db.close()
+
+
+# ============================================================ КНОПОЧНЫЙ РЕЖИМ
+# CONTACTS_MODE=button (дефолт с 12.11.2026): карточка уходит СРАЗУ из анонимных
+# данных, контакты — по нажатию кнопки (1 auth-запрос от человека). Пачек
+# авто-просмотров нет — флагу automation_detected нечего ловить.
+
+def _make_button_monitor(landing_html: dict[str, str] | None = None,
+                         feed_items: list | None = None) -> tuple[Monitor, FakeClient, FakeSender, Database]:
+    cfg = Config(bot_token="x")
+    cfg.hirify_feeds = "remote"
+    cfg.tg_channels = ""
+    cfg.remote_strict = False
+    cfg.crypto_strict = False
+    cfg.industry_strict = False
+    cfg.auth_views_hour_max = 10**9
+    cfg.auth_views_day_max = 10**9
+    assert cfg.contacts_mode == "button"  # дефолт
+    client = FakeClient(feed_items if feed_items is not None else FEED_ITEMS[:1], VACANCIES)
+    if landing_html:
+        client.landing_html.update(landing_html)
+    sender = FakeSender()
+    tmpdir = tempfile.mkdtemp(prefix="hirify_test_")
+    db = Database(Path(tmpdir) / "t.db")
+    db.add_subscriber(1, "@tester")
+    mon = Monitor(client, db, sender, cfg)
+    return mon, client, sender, db
+
+
+def test_button_mode_delivers_without_any_auth_request():
+    """Кнопочный режим: контакта на публичной странице нет → карточка всё
+    равно уходит СРАЗУ (контакты — кнопкой), НОЛЬ запросов от имени аккаунта."""
+    mon, client, sender, db = _make_button_monitor()   # landing_html пуст — контакта нет
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["button"] == 1
+    assert client.job_fetches == 0 and client.contacts_fetches == 0
+    assert client.landing_fetches == 1
+    v = sender.vacancies[0]
+    assert v.contacts_by_button is True
+    assert db.job_status(101) == "sent"
+    db.close()
+
+
+def test_button_mode_public_contact_still_delivers_inline():
+    """Если контакт виден анонимно — карточка уходит с контактом сразу,
+    кнопка не нужна (тот же исход, что был в анонимном пути)."""
+    mon, client, sender, db = _make_button_monitor(
+        {"101-senior-solidity-engineer": _landing(
+            "Solidity Engineer",
+            "Мы ищем инженера. Контакты: Telegram @acme_crypto_hr "
+            "или https://t.me/acme_crypto_hr")}
+    )
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["anon"] == 1 and stats["button"] == 0
+    assert client.job_fetches == 0
+    v = sender.vacancies[0]
+    assert v.contacts_by_button is False and v.has_direct_contact
+    db.close()
+
+
+def test_button_mode_delivers_during_automation_pause():
+    """Флаг не останавливает доставку: карточки с кнопкой уходят и на паузе —
+    бэклог не копится, вакансии не теряются (208 skipped_stale за один день
+    было причиной паузы в авто-режиме)."""
+    mon, client, sender, db = _make_button_monitor()
+    mon._automation_until = time.time() + 3600
+    mon._automation_last_flag = time.time()
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["button"] == 1
+    assert client.job_fetches == 0 and client.contacts_fetches == 0
+    assert db.job_status(101) == "sent"
+    db.close()
+
+
+def test_button_mode_fallback_card_from_feed_item_when_landing_fails():
+    """Лендинг не отдался/не разобрался → карточка строится из полей фида
+    (короче, но данные достоверны) — тоже без единого запроса аккаунта."""
+    mon, client, sender, db = _make_button_monitor()
+    async def boom(url: str) -> str:
+        raise RuntimeError("сеть отдалась 500")
+    client.fetch_job = boom                       # лендинг сломан
+    client.feed_items = [{
+        "id": 105, "slug": "105-media-buyer-cpa",
+        "title": "Media Buyer CPA", "company_title": "Acq Ltd",
+        "tldr": "Кратко о вакансии", "work_format": ["remote"], "remote_type": "global",
+        "created_at": "2026-11-12T05:00:00.000000Z", "source": "telegram",
+        "is_scam": False, "is_potential_scam": False,
+        "main_stack": [{"id": 1, "name": "media buying"}],
+    }]
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["sent"] == 1 and stats["button"] == 1
+    assert client.job_fetches == 0 and client.contacts_fetches == 0
+    v = sender.vacancies[0]
+    assert v.title == "Media Buyer CPA" and v.company == "Acq Ltd"
+    assert v.contacts_by_button is True
+    assert "Кратко" in v.description
     db.close()

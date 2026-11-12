@@ -14,7 +14,7 @@ from .hirify import (
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
     HirifyNotFound, HirifyRestrictedError,
 )
-from .parsing import CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, parse_job_page, vacancy_from_api
+from .parsing import CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, parse_job_page, vacancy_from_api, vacancy_from_feed_item
 from .sender import VacancySender
 from .textparse import looks_like_vacancy, parse_vacancy_text
 
@@ -113,6 +113,33 @@ class Monitor:
     def automation_left_sec(self) -> float:
         """Сколько ещё держится пауза после флага автоматизации (для /status и /fresh)."""
         return max(0.0, self._automation_until - time.time())
+
+    # --------------------------------------------- кнопка «Показать контакты»
+
+    def auth_quota_block(self) -> str | None:
+        """Публичная обёртка квот auth-просмотров для callback-хендлера.
+
+        Возвращает строку-причину, если часовой/суточный лимит исчерпан,
+        иначе None (кнопка «Показать контакты» может сделать запрос).
+        """
+        return self._auth_quota_block()
+
+    def register_automation_hit(self, e: Exception, chat_ids: list[int]) -> int:
+        """Флаг automation_detected из кнопки «Показать контакты».
+
+        Ставит эскалирующую паузу (в БД — переживает замещение ранов) и
+        предупреждает перечисленные чаты. Возвращает длительность, мин.
+        """
+        return self._register_automation(e, [{"chat_id": cid} for cid in chat_ids])
+
+    def automation_recovered(self) -> None:
+        """Успешный auth-просмотр по кнопке после флага — сайт снял ограничение
+        (сброс эскалации по правилам памяти 48 ч)."""
+        self._automation_healed([], announce=False)
+
+    def auth_view_spent(self) -> None:
+        """Публичная обёртка счётчика auth-просмотров для callback-хендлера."""
+        self._auth_view_spent()
 
     # ---------------------------------------------------------------- API
 
@@ -238,7 +265,7 @@ class Monitor:
         return {
             "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
             "stale": 0, "fetch_failed": 0, "send_failed": 0, "no_audience": 0,
-            "anon": 0, "cookie_warn": False, "automation_pause": False,
+            "anon": 0, "button": 0, "cookie_warn": False, "automation_pause": False,
             "quota_deferred": 0,
         }
 
@@ -464,8 +491,8 @@ class Monitor:
             # блок «Контакты: Telegram @handle», поэтому большинство вакансий
             # уходит подписчикам вообще без запросов от имени аккаунта:
             # сайту нечего считать и нечего флагать (анти-automation_detected).
+            v = None
             if self.cfg.anon_first:
-                v = None
                 try:
                     landing = await self.client.fetch_job(url)
                     v = parse_job_page(landing, url)
@@ -490,9 +517,43 @@ class Monitor:
                     continue
                 # публичная страница контакта не дала → auth-путь ниже
 
-            # --- ПАУЗА АВТОМАТИЗАЦИИ: auth-запросы закрыты. Вакансия остаётся
-            # 'new' — вернётся ретраем, когда сайт снимет флаг; свежесть для
-            # публикаций, застрявших на паузе, расширена (см. _fresh_threshold_ts).
+            # --- КНОПОЧНЫЙ РЕЖИМ (CONTACTS_MODE=button, ПО УМОЛЧАНИЮ):
+            # карточка уходит подписчику СЕЙЧАС из анонимных данных; контакт
+            # человек получит нажатием «Показать контакты» — один auth-запрос
+            # от живого интереса вместо пачки авто-просмотров. Именно пачки
+            # сайт и флажит (automation_detected), поэтому здесь их больше
+            # нет в принципе; пауза флага и квоты не касаются доставки.
+            if self.cfg.contacts_mode != "auto":
+                if v is None:
+                    # лендинг не отдался/не разобрался → карточка из полей
+                    # фида (короче, но без единого запроса аккаунта)
+                    v = vacancy_from_feed_item(item, url, feed)
+                skip = self._strict_filter_reason(v, feed)
+                if skip:
+                    self.db.mark_job(job_id, skip)
+                    stats["filtered"] += 1
+                    log.debug("job %d: строгий фильтр (кнопочный режим) → %s", job_id, skip)
+                    continue
+                if v.has_direct_contact:
+                    self.db.update_job_parsed(
+                        job_id, title=v.title, company=v.company, salary=v.salary,
+                        tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display}
+                                     for c in v.contacts],
+                    )
+                    stats["anon"] += 1
+                    log.info("job %d: контакт виден анонимно — доставлено без запросов аккаунта", job_id)
+                else:
+                    v.contacts_by_button = True
+                    self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
+                    stats["button"] += 1
+                    log.info("job %d: карточка доставлена — контакты по кнопке (ноль запросов аккаунта)", job_id)
+                await self._deliver_vacancy(job_id, v, recipients, stats)
+                continue
+
+            # --- ПАУЗА АВТОМАТИЗАЦИИ (только auto-режим): auth-запросы закрыты.
+            # Вакансия остаётся 'new' — вернётся ретраем, когда сайт снимет
+            # флаг; свежесть для публикаций, застрявших на паузе, расширена
+            # (см. _fresh_threshold_ts).
             if paused:
                 continue
 

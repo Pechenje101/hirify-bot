@@ -130,8 +130,12 @@ class VacancySender:
         # Кнопки «Написать/Копировать» уже внутри виджета (openTelegramLink /
         # copyText). Для контакта вида tg://user?id= виджет открывать чат не
         # умеет — под виджет уходит обычная инлайн-клавиатура с кнопкой-URL.
+        # Кнопочный режим (контактов нет вообще): под виджет уходит та же
+        # инлайн-клавиатура с «👤 Показать контакты» (callback).
         markup = None
-        if v.primary_contact and v.primary_contact.kind == "user_id":
+        if v.contacts_by_button:
+            markup = inline_keyboard(v)
+        elif v.primary_contact and v.primary_contact.kind == "user_id":
             markup = inline_keyboard(v)
         await self._with_retry(
             lambda: self.bot(
@@ -155,11 +159,16 @@ class VacancySender:
         html = render_rich_html(v)
         # ВАЖНО: без reply_markup — кнопки уже внутри rich-разметки (tg-button),
         # иначе у сообщения были бы дублирующиеся ряды кнопок.
+        # ИСКЛЮЧЕНИЕ — кнопочный режим: контактов нет → внутри разметки кнопок
+        # не оказалось; единственная кнопка «👤 Показать контакты» (callback)
+        # может быть только инлайн-клавиатурой.
+        markup = inline_keyboard(v) if v.contacts_by_button else None
         await self._with_retry(
             lambda: self.bot.send_rich_message(
                 chat_id=chat_id,
                 rich_message=InputRichMessage(html=html),
                 disable_notification=silent,
+                reply_markup=markup,
             )
         )
 
@@ -181,13 +190,14 @@ class VacancySender:
 
     # ------------------------------------------------------------ служебное
 
-    async def send_text(self, chat_id: int, html: str) -> None:
+    async def send_text(self, chat_id: int, html: str, markup=None) -> None:
         await self._with_retry(
             lambda: self.bot.send_message(
                 chat_id=chat_id,
                 text=html,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                reply_markup=markup,
             )
         )
 

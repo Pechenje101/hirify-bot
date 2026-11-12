@@ -1,8 +1,11 @@
 """Команды бота (aiogram Router) + страховка от необработанных ошибок."""
 from __future__ import annotations
 
+import asyncio
 import html as html_mod
+import json
 import logging
+import random
 import time
 
 from aiogram import F, Router
@@ -13,7 +16,9 @@ from . import texts
 from .cards import demo_vacancy
 from .config import Feed
 from .db import DEFAULT_DISPLAY, DISPLAY_MODES
+from .hirify import HirifyAutomationError, HirifyRestrictedError
 from .monitor import POLL_JITTER
+from .parsing import _api_contacts
 from .services import Services
 from .textparse import looks_like_vacancy, parse_vacancy_text
 
@@ -401,6 +406,125 @@ async def on_settings_callback(cb: CallbackQuery, services: Services):
         await cb.answer(f"Вид карточек: {label}{note}")
     else:
         await cb.answer("✅ Сохранено")
+
+
+# ------------------------------------------------ кнопка «Показать контакты»
+# Кнопочный режим (CONTACTS_MODE=button): карточка уходит из анонимных данных,
+# а контакт человек получает одним нажатием — ровно один auth-запрос от
+# живого интереса. Это тот паттерн, который сайт ожидает от человека;
+# пачек авто-просмотров (главный триггер automation_detected) больше нет.
+
+_CNT_LAST: dict[tuple[int, int], float] = {}
+_CNT_COOLDOWN_SEC = 20  # анти-даблклик; кнопка остаётся на карточке
+
+
+async def fetch_contacts_for_job(job_id: int, services: Services) -> tuple[str, list[dict]]:
+    """Ядро кнопки: возвращает (исход, контакты-словари).
+
+    Исходы: "cached" / "ok" — контакты есть (кэш БД или свежий запрос);
+    "empty" — сайт контактов не отдал; "noid" — вакансии нет в базе;
+    "pause:N" — флаг держит паузу ещё N мин; "quota" — лимит исчерпан;
+    "noauth" — cookie не задан; "restricted" — контакты недоступны;
+    "flag:N" — запрос словил флаг, пауза N мин поставлена; "fail" — сбой.
+    """
+    db, mon, client = services.db, services.monitor, services.client
+    job = db.get_job(job_id)
+    if job is None:
+        return "noid", []
+    try:
+        cached = json.loads(job.get("tg_contacts") or "[]")
+    except (TypeError, ValueError):
+        cached = []
+    if cached:
+        return "cached", cached
+
+    left = mon.automation_left_sec
+    if left > 0:
+        return f"pause:{left / 60:.0f}", []
+    if mon.auth_quota_block():
+        return "quota", []
+    if not client.has_cookie:
+        return "noauth", []
+
+    # полный слаг хранится в URL вакансии (fetch_contacts ждёт <id>-<slug>)
+    full_slug = (job.get("url") or "").rstrip("/").rsplit("/", 1)[-1] or job.get("slug") or ""
+    if not full_slug:
+        return "noid", []
+    try:
+        await asyncio.sleep(random.uniform(0.6, 2.5))  # живой темп, не метроном
+        contacts_data = await client.fetch_contacts(full_slug)
+    except HirifyAutomationError as e:
+        minutes = mon.register_automation_hit(e, [])
+        return f"flag:{minutes}", []
+    except HirifyRestrictedError:
+        return "restricted", []
+    except Exception as e:  # noqa: BLE001 — сеть/таймаут/5xx
+        log.warning("Кнопка «контакты» (%s): %s", full_slug, e)
+        return "fail", []
+    mon.auth_view_spent()
+
+    contacts = _api_contacts(contacts_data or {})
+    if not contacts:
+        return "empty", []
+    entries = [{"kind": c.kind, "value": c.value, "display": c.display} for c in contacts]
+    db.update_job_parsed(job_id, tg_contacts=entries)
+    mon.automation_recovered()
+    return "ok", entries
+
+
+async def _reply_contacts(services: Services, chat_id: int, job: dict, entries: list[dict]) -> None:
+    """Сообщение с контактами (после кнопки): коротко + кнопка «Написать»."""
+    title = html_mod.escape(str(job.get("title") or "вакансия"))
+    rows = [f"• <b>{html_mod.escape(str(e.get('display') or e.get('value') or ''))}</b>"
+            for e in entries[:3] if e.get("display") or e.get("value")]
+    text = f"👤 Контакты — {title}:\n" + "\n".join(rows)
+    buttons = []
+    for e in entries[:2]:
+        value, kind = str(e.get("value") or ""), str(e.get("kind") or "")
+        if kind == "username" and value:
+            buttons.append(InlineKeyboardButton(text=f"✉️ @{value}", url=f"https://t.me/{value}"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+    await services.sender.send_text(chat_id, text, markup=markup)
+
+
+@router.callback_query(F.data.startswith("cnt:"))
+async def on_contacts_button(cb: CallbackQuery, services: Services):
+    """Кнопка «Показать контакты»: один auth-запрос от человека."""
+    try:
+        job_id = int(str(cb.data or "").split(":", 1)[1])
+    except ValueError:
+        await cb.answer("Неизвестная вакансия", show_alert=True)
+        return
+    uid = cb.from_user.id if cb.from_user else 0
+    now = time.monotonic()
+    if now - _CNT_LAST.get((uid, job_id), 0.0) < _CNT_COOLDOWN_SEC:
+        await cb.answer("Уже обрабатываю — подождите пару секунд")
+        return
+    _CNT_LAST[(uid, job_id)] = now
+
+    outcome, entries = await fetch_contacts_for_job(job_id, services)
+    if entries and outcome in ("cached", "ok"):
+        await cb.answer()
+        job = services.db.get_job(job_id) or {"title": ""}
+        chat_id = cb.message.chat.id if cb.message else uid
+        await _reply_contacts(services, chat_id, job, entries)
+        return
+    if outcome == "noid":
+        await cb.answer("Вакансия уже не найдена в базе", show_alert=True)
+    elif outcome.startswith("pause:"):
+        await cb.answer(f"hirify временно ограничил просмотры (≈{outcome.split(':', 1)[1]} мин) — попробуйте позже", show_alert=True)
+    elif outcome == "quota":
+        await cb.answer("Лимит просмотров на час исчерпан — попробуйте позже", show_alert=True)
+    elif outcome == "noauth":
+        await cb.answer("Cookie не задан — контакты недоступны (см. /help)", show_alert=True)
+    elif outcome == "restricted":
+        await cb.answer("Контакты этой вакансии недоступны (премиум/скрыто)", show_alert=True)
+    elif outcome.startswith("flag:"):
+        await cb.answer(f"hirify ограничил просмотры на {outcome.split(':', 1)[1]} мин — попробуйте позже", show_alert=True)
+    elif outcome in ("empty", "fail"):
+        await cb.answer("Не получилось достать контакты — попробуйте позже", show_alert=True)
+    else:
+        await cb.answer()
 
 
 @router.message(Command("pause"))

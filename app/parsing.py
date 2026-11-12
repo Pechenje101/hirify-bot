@@ -51,6 +51,10 @@ class Vacancy:
     contacts_hidden: bool = False  # на странице написано «Show contacts»/«после авторизации»
     feed_key: str = ""             # из какого раздела пришла: remote/global/crypto…
     feed_label: str = ""           # метка раздела для карточки («🌍 Глобальная удалёнка»)
+    # КНОПОЧНЫЙ режим (CONTACTS_MODE=button): контакт анонимно не виден —
+    # карточка ушла сразу, а кнопка «Показать контакты» сделает 1 auth-запрос
+    # по нажатию человека (живой интерес вместо пачки авто-просмотров)
+    contacts_by_button: bool = False
 
     @property
     def has_direct_contact(self) -> bool:
@@ -640,6 +644,54 @@ def _api_contacts(contacts_data: dict) -> list[TGContact]:
             out.append(TGContact("username", handle, f"@{handle}",
                                 f"https://t.me/{handle}", "contacts"))
     return out
+
+
+def vacancy_from_feed_item(item: dict, url: str, feed=None) -> Vacancy:
+    """Vacancy из элемента АНОНИМНОГО фида — карточка-фолбэк кнопочного режима,
+    когда публичная страница не отдалась (нет ни одного запроса аккаунта).
+
+    Полного описания в фиде нет — вместо него tldr; остальные поля фида
+    (title/company/salary/стек/формат/регион) — те же, что видит сайт.
+    """
+    m = re.search(r"/jobs/(\d+)-([a-z0-9\-_%]+)", url, re.IGNORECASE)
+    try:
+        job_id = int(item.get("id") or (m.group(1) if m else 0) or 0)
+    except (TypeError, ValueError):
+        job_id = 0
+    slug = str(item.get("slug") or (m.group(2) if m else "") or "")
+    v = Vacancy(job_id=job_id, slug=slug, url=url)
+    v.title = _first(item.get("title"), item.get("original_title"))
+    v.company = _first(item.get("company_title"))
+    wf = item.get("work_format")
+    if isinstance(wf, list):
+        v.work_format = ", ".join(x for x in wf if x)
+    else:
+        v.work_format = _first(wf)
+    rt = item.get("remote_type")
+    if rt and "remote" in (v.work_format or "").lower():
+        v.work_format = f"{v.work_format} · {rt}"
+    grades = item.get("grades") or []
+    names = [str(g.get("name") or g) for g in grades if isinstance(g, (dict, str))]
+    v.grade = _first(*names[:1]) if names else ""
+    regions = item.get("regions") or []
+    if isinstance(regions, list) and regions and isinstance(regions[0], dict):
+        v.location = ", ".join(x for x in (r.get("name") for r in regions if isinstance(r, dict)) if x)
+    v.salary = _salary_from_api(item.get("salary"))
+    stack: list[str] = []
+    for t in (item.get("main_stack") or item.get("tags") or []):
+        if isinstance(t, dict):
+            name = t.get("name")
+            if name:
+                stack.append(str(name))
+        else:
+            stack.append(str(t))
+    v.skills = stack[:12]
+    v.description = _clean_description(item.get("tldr") or "")
+    v.date_posted = str(item.get("created_at") or "")[:10]
+    v.source_type = _first(item.get("source"))
+    if feed is not None:
+        v.feed_key, v.feed_label = feed.key, feed.label
+    return v
 
 
 def vacancy_from_api(data: dict, contacts_data: dict,

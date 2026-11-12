@@ -457,6 +457,12 @@ def inline_keyboard(v: Vacancy):
                 )
             )
         buttons.append(row)
+    elif getattr(v, "contacts_by_button", False):
+        # КНОПОЧНЫЙ режим: контакт анонимно не виден — человек получит его
+        # одним нажатием (1 auth-запрос от живого интереса, не пачкой)
+        buttons.append([
+            InlineKeyboardButton(text="👤 Показать контакты", callback_data=f"cnt:{v.job_id}")
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
