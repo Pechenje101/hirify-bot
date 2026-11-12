@@ -80,6 +80,11 @@ def parse_feeds(raw: str) -> list[Feed]:
 
     Элемент может быть ключом пресета (remote/global/crypto/crypto_remote/all),
     путём ('/some-landing-jobs') или полным URL. Дубликаты выкидываем.
+
+    Специальное значение none/off/disabled — hirify-источники ВЫКЛЮЧЕНЫ:
+    пустой список без отката на пресеты (сайт заморожен до официального
+    API; ТГ-каналы из TG_CHANNELS продолжают работать, auth-запросов
+    к сайту нет вовсе — «none» в списке глушит всё).
     """
     feeds: list[Feed] = []
     seen: set[str] = set()
@@ -87,6 +92,8 @@ def parse_feeds(raw: str) -> list[Feed]:
         token = part.strip().strip("/")
         if not token:
             continue
+        if token.lower() in {"none", "off", "disabled"}:
+            return []
         if token in FEED_PRESETS:
             feed = FEED_PRESETS[token]
         elif token.startswith("http"):

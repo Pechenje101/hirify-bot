@@ -40,6 +40,11 @@ def test_parse_feeds():
     assert [f.key for f in parse_feeds(" remote , crypto ")] == ["remote", "crypto"]
     # пусто → дефолтные разделы
     assert [f.key for f in parse_feeds("")] == ["remote", "global", "crypto"]
+    # «none» (и любой off-токен) — hirify-источники выключены: пустой список
+    # БЕЗ отката на пресеты; глушит и смешанный список
+    assert parse_feeds("none") == []
+    assert parse_feeds("OFF") == []
+    assert parse_feeds(" none , remote") == []
     # свой лендинг
     f = parse_feeds("/fintech-jobs")[0]
     assert f.base_url == "https://hirify.me/fintech-jobs"
@@ -50,6 +55,18 @@ def test_parse_feeds():
     assert FEED_PRESETS["global"].base_url == "https://hirify.me/remote-jobs"
     assert FEED_PRESETS["crypto"].base_url.endswith("web3-crypto-jobs")
     assert FEED_PRESETS["crypto_remote"].base_url.endswith("web3-crypto-remote-jobs")
+
+
+def test_hirify_feeds_off(monkeypatch):
+    """HIRIFY_FEEDS=none — сайт заморожен: в источниках только ТГ-каналы."""
+    monkeypatch.setenv("HIRIFY_FEEDS", "none")
+    monkeypatch.setenv("TG_CHANNELS", "cpa_people")
+    cfg = Config(bot_token="x")
+    assert [f.source for f in cfg.feeds] == ["tg"]
+    # и вовсе без источников — бот жив, просто опрашивать нечего
+    monkeypatch.setenv("TG_CHANNELS", "")
+    cfg2 = Config(bot_token="x")
+    assert cfg2.feeds == []
 
 
 def test_db_lifecycle(tmp=None):
