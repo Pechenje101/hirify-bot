@@ -21,7 +21,7 @@ from .digest import (
     render_digest, selection_keyboard, selection_text, sessions, suggest,
 )
 from .hirify import HirifyAutomationError, HirifyRestrictedError
-from .moderation import moderation_target, panel_keyboard, panel_text, publish_job
+from .moderation import auto_bind_channel, moderation_target, panel_keyboard, panel_text, publish_job
 from .monitor import POLL_JITTER
 from .parsing import _api_contacts
 from .services import Services
@@ -766,6 +766,25 @@ async def _is_admin_guard(message: Message, services: Services) -> bool:
     return True
 
 
+@router.channel_post()
+async def on_channel_post(post: Message, services: Services):
+    """Авто-привязка канала публикаций: бот уже админ — как только в канале
+    появился первый пост, канал запоминается (если ещё не задан явно).
+
+    Апдейты channel_post бот получает в каждый канал, где он админ;
+    aiogram включает этот тип в getUpdates автоматически (по факту
+    регистрации хендлера). Собственные посты (карточки из «✅ Опубликовать»)
+    триггером не считаем.
+    """
+    bot_id = post.bot.id if post.bot else 0
+    if post.from_user and bot_id and post.from_user.id == bot_id:
+        return
+    await auto_bind_channel(
+        post.chat.id, post.chat.title or "", services.cfg, services.db,
+        services.sender,
+    )
+
+
 @router.message(Command("setchannel"))
 async def cmd_setchannel(message: Message, command: CommandObject, services: Services):
     """Задать/показать канал публикаций (только владелец).
@@ -791,7 +810,9 @@ async def cmd_setchannel(message: Message, command: CommandObject, services: Ser
             await message.answer(
                 "📡 Канал публикаций не задан.\n\n"
                 "1) Добавьте бота админом в канал с правом отправки сообщений\n"
-                "2) /setchannel &lt;@имя канала или -100…&gt;\n\n"
+                "2) /setchannel &lt;@имя канала или -100…&gt; — или просто напишите\n"
+                "    что-нибудь в канале: бот привяжет его сам и пришлёт\n"
+                "    уведомление\n\n"
                 "После этого каждая карточка будет приходить с кнопками"
                 " «✅ Опубликовать» / «❌ Отклонить», а решённые — поститься"
                 " в канал нативно, без «Переслано от…».",

@@ -13,8 +13,10 @@
    нерешённые панели заново после любого рестарта.
 
 Канал публикации задаётся /setchannel <@имя | -100…> (админ; хранится в БД)
-или POST_CHANNEL_ID в окружении. Модерация включается, когда заданы И канал,
-И ADMIN_CHAT_ID: панель приходит в личный чат владельца.
+или POST_CHANNEL_ID в окружении. Если бот уже добавлен в канал админом,
+канал привяжется и САМ — по первому посту в нём (auto_bind_channel:
+апдейты channel_post приходят боту-админу). Модерация включается, когда
+заданы И канал, И ADMIN_CHAT_ID: панель приходит в личный чат владельца.
 """
 from __future__ import annotations
 
@@ -48,6 +50,36 @@ def moderation_target(cfg, db) -> int | None:
 def moderation_active(cfg, db) -> bool:
     """Панели шлём только когда есть и канал, и чат владельца."""
     return bool(moderation_target(cfg, db) and cfg.admin_chat_id)
+
+
+async def auto_bind_channel(chat_id: int, title: str, cfg, db, sender) -> bool:
+    """Авто-привязка канала публикаций — бот уже добавлен админом.
+
+    Апдейты channel_post приходят боту в КАЖДЫЙ канал, где он админ: первый
+    пост в ещё не привязанном канале запоминает его (настройка в БД) и
+    уведомляет владельца. Явно заданный канал (/setchannel или
+    POST_CHANNEL_ID) подменять нельзя — защита от случайного канала.
+    Возвращает True, если привязка произошла.
+    """
+    if moderation_target(cfg, db):
+        return False
+    db.set_setting("post_channel_id", str(chat_id))
+    log.info("Канал публикаций привязан автоматически: %s (%s)", title, chat_id)
+    if cfg.admin_chat_id:
+        shown = title.strip() or str(chat_id)
+        try:
+            await sender.send_text(
+                cfg.admin_chat_id,
+                f"📡 Канал публикаций привязан автоматически: <b>{E(shown)}</b>\n\n"
+                "Каждая новая карточка теперь приходит с кнопками"
+                " «✅ Опубликовать» / «❌ Отклонить», а «✅ Опубликовать» —"
+                " постит её в этот канал нативным постом.\n"
+                "Очередь решений: /pending · не тот канал? /setchannel &lt;@имя&gt;"
+                " · выключить: /setchannel off",
+            )
+        except Exception as e:  # noqa: BLE001 — уведомление не критично
+            log.warning("Уведомление о привязке канала %s не ушло: %s", chat_id, e)
+    return True
 
 
 # ---------------------------------------------------------------- панель

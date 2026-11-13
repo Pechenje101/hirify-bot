@@ -15,8 +15,8 @@ from app.config import Config  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
 from app.moderation import (  # noqa: E402
-    moderation_active, moderation_target, panel_keyboard, panel_text,
-    publish_job, queue_for_moderation,
+    auto_bind_channel, moderation_active, moderation_target, panel_keyboard,
+    panel_text, publish_job, queue_for_moderation,
 )
 from app.parsing import vacancy_from_payload, vacancy_to_payload  # noqa: E402
 from app.services import Services  # noqa: E402
@@ -317,3 +317,100 @@ def test_queue_for_moderation_direct():
     asyncio.run(queue_for_moderation(402, v, cfg, db, sender, False))
     assert db.get_job(402)["mod_status"] == "" and len(sender.texts) == 1
     db.close()
+
+
+# ---------------------------------------------------------------- авто-привязка
+
+def test_auto_bind_on_first_channel_post():
+    """Бот уже админ: первый пост в канале привязывает его и уведомляет
+    владельца; пост в другом канале больше ничего не меняет."""
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    cfg = make_cfg(post_channel_id=0)  # канал не задан
+    sender = FakeSender()
+    assert asyncio.run(auto_bind_channel(-100777, "My Vacancies", cfg, db, sender)) is True
+    assert db.get_setting("post_channel_id") == "-100777"
+    assert moderation_target(cfg, db) == -100777
+    assert moderation_active(cfg, db) is True
+    assert len(sender.texts) == 1
+    chat, html, _ = sender.texts[0]
+    assert chat == ADMIN and "My Vacancies" in html and "/pending" in html
+    # второй канал не подменяет и не спамит уведомлениями
+    assert asyncio.run(auto_bind_channel(-100888, "Other", cfg, db, sender)) is False
+    assert moderation_target(cfg, db) == -100777
+    assert len(sender.texts) == 1
+    db.close()
+
+
+def test_auto_bind_does_not_override_explicit_channel():
+    """Явное (/setchannel в БД, POST_CHANNEL_ID в env) важнее авто-привязки."""
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    sender = FakeSender()
+    cfg_env = make_cfg(post_channel_id=CHANNEL)  # задан через окружение
+    assert asyncio.run(auto_bind_channel(-100222, "X", cfg_env, db, sender)) is False
+    assert sender.texts == []
+    cfg = make_cfg(post_channel_id=0)
+    db.set_setting("post_channel_id", "-100111")  # задан через /setchannel
+    assert asyncio.run(auto_bind_channel(-100222, "X", cfg, db, sender)) is False
+    assert db.get_setting("post_channel_id") == "-100111"
+    assert sender.texts == []
+    db.close()
+
+
+def test_auto_bind_survives_notify_failure_and_works_without_admin():
+    """Сбой уведомления не мешает привязке; без ADMIN_CHAT_ID — привязка
+    беззвучная (панелей и так не будет до заданного админа)."""
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+
+    class BoomSender(FakeSender):
+        async def send_text(self, chat_id, html, markup=None):
+            raise RuntimeError("fl00d")
+
+    cfg = make_cfg(post_channel_id=0)
+    assert asyncio.run(auto_bind_channel(-100333, "Y", cfg, db, BoomSender())) is True
+    assert db.get_setting("post_channel_id") == "-100333"
+    db.close()
+
+    db2 = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    cfg2 = make_cfg(post_channel_id=0, admin=0)
+    sender2 = FakeSender()
+    assert asyncio.run(auto_bind_channel(-100444, "Z", cfg2, db2, sender2)) is True
+    assert db2.get_setting("post_channel_id") == "-100444"
+    assert sender2.texts == []
+    db2.close()
+
+
+def test_channel_post_handler_ignores_own_posts():
+    """Хендлер channel_post: собственные публикации (карточки) и посты
+    без автора (анонимный админ — from может отсутствовать) не путают
+    авто-привязку; пост владельца привязывает канал."""
+    from types import SimpleNamespace
+
+    from app.handlers import on_channel_post
+
+    def post(author_id, chat_id=-100777, title="My Vacancies"):
+        return SimpleNamespace(
+            bot=SimpleNamespace(id=777),
+            from_user=SimpleNamespace(id=author_id) if author_id else None,
+            chat=SimpleNamespace(id=chat_id, title=title, type="channel"),
+        )
+
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    sender = FakeSender()
+    services = make_services(post_channel_id=0, db=db, sender=sender)
+    # пост самого бота (карточка из «✅ Опубликовать») — не триггер
+    asyncio.run(on_channel_post(post(777), services))
+    assert db.get_setting("post_channel_id") == ""
+    # пост владельца — привязка + уведомление
+    asyncio.run(on_channel_post(post(ADMIN), services))
+    assert db.get_setting("post_channel_id") == "-100777"
+    assert len(sender.texts) == 1
+    db.close()
+
+    db2 = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    sender2 = FakeSender()
+    services2 = make_services(post_channel_id=0, db=db2, sender=sender2)
+    # анонимный админ (from_user=None) — тоже привязка
+    asyncio.run(on_channel_post(post(None), services2))
+    assert db2.get_setting("post_channel_id") == "-100777"
+    assert len(sender2.texts) == 1
+    db2.close()
