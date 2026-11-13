@@ -21,8 +21,8 @@ html (Bot API 10.1+), поэтому описание уходит целико�
 ограничена 4096 символами видимого текста — там тоже всё описание, в
 сворачиваемой цитате <blockquote expandable>, автобюджет подгоняет длину.
 
-Кнопки: «Написать рекрутеру» — style=success (rich) / style=primary
-(классика, Bot API 9.4+) — акцентная, «Копировать контакт» — нейтральная.
+Кнопки: ровно одна — «Написать рекрутеру»: style=success (rich) / style=primary
+(классика, Bot API 9.4+) — акцентная. «Копировать контакт» убрана 13.11.
 
 Тени/слои в полном объёме показывает HTML-превью (scripts/make_preview.py).
 
@@ -325,20 +325,15 @@ def _rich_impl(v: Vacancy, desc_limit: int) -> str:
             f"<details><summary>Ещё Telegram-контакты: {len(extra)}</summary>{lines}</details>"
         )
 
-    # --- кнопки: только действие — написать и скопировать контакт ---
+    # --- кнопки: ровно одно действие — написать (решение владельца 13.11:
+    #     «Копировать контакт» убрана, остаётся только главная кнопка) ---
     btns: list[str] = []
     if primary:
         btns.append(
             f'<tg-button type="url" style="success" url="{E(primary.url, quote=True)}">{_contact_action(primary)}</tg-button>'
         )
-        if primary.kind == "username":
-            btns.append(
-                f'<tg-button type="copy_text" text="{E(primary.display, quote=True)}">Копировать контакт</tg-button>'
-            )
     if btns:
-        parts.append('<tg-button-row align="left">' + "".join(btns[:2]) + "</tg-button-row>")
-        if len(btns) > 2:
-            parts.append("<tg-button-row>" + "".join(btns[2:]) + "</tg-button-row>")
+        parts.append('<tg-button-row align="left">' + "".join(btns) + "</tg-button-row>")
 
     # --- подвал: относительная свежесть (без даты — без подвала) ---
     footer = _footer_line(v)
@@ -435,28 +430,22 @@ def _classic_impl(v: Vacancy, desc_limit: int) -> str:
 # ---------------------------------------------------------------- клавиатура
 
 def inline_keyboard(v: Vacancy):
-    """InlineKeyboardMarkup для классического сообщения: максимум два действия."""
-    from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+    """InlineKeyboardMarkup для классического сообщения: одна главная кнопка."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     buttons: list[list] = []
     primary = v.primary_contact
     if primary:
-        row = [
+        # одна главная кнопка-действие: «Копировать контакт» убрана
+        # (решение владельца 13.11)
+        buttons.append([
             InlineKeyboardButton(
                 text="✉️ Открыть контакт (пост в канале)" if primary.kind == "channel"
                 else "✉️ Написать рекрутеру",
                 url=primary.url,
                 style="primary",  # Bot API 9.4+: акцентная синяя кнопка
             )
-        ]
-        if primary.kind == "username":
-            row.append(
-                InlineKeyboardButton(
-                    text="📋 Копировать контакт",
-                    copy_text=CopyTextButton(text=primary.display),
-                )
-            )
-        buttons.append(row)
+        ])
     elif getattr(v, "contacts_by_button", False):
         # КНОПОЧНЫЙ режим: контакт анонимно не виден — человек получит его
         # одним нажатием (1 auth-запрос от живого интереса, не пачкой)

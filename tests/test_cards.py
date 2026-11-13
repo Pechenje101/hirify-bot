@@ -19,7 +19,7 @@ from app.cards import (  # noqa: E402
 DEMO = demo_vacancy()
 
 # Кнопок, которые пользователь попросил убрать, быть не должно нигде
-REMOVED_BUTTONS = ("Пост в канале", "Вакансия на Hirify", "Вакансия на hirify")
+REMOVED_BUTTONS = ("Пост в канале", "Вакансия на Hirify", "Вакансия на hirify", "Копировать контакт")
 
 
 def test_rich_html_structure():
@@ -45,7 +45,7 @@ def test_rich_html_structure():
     # контакт-панель (blockquote = подложка с акцентом в клиентах) и кнопки-действия
     assert "<blockquote>👤 Рекрутер: <b>@demo_recruiter</b><br/>" in html
     assert '<tg-button type="url" style="success" url="https://t.me/demo_recruiter">Написать рекрутеру</tg-button>' in html
-    assert '<tg-button type="copy_text" text="@demo_recruiter">Копировать контакт</tg-button>' in html
+    # ровно одна кнопка-действие (решение 13.11: копирование убрано)
     # удалённые кнопки действительно удалены
     for btn in REMOVED_BUTTONS:
         assert btn not in html, f"кнопка «{btn}» должна быть убрана"
@@ -273,16 +273,13 @@ def test_inline_keyboard():
     assert rows, "клавиатура пуста"
     flat = [b for row in rows for b in row]
     texts = [b.text for b in flat]
-    # только два действия: написать и скопировать
+    # ровно ОДНО действие — написать (копирование убрано 13.11)
     assert any("Написать рекрутеру" in t for t in texts)
-    assert any("Копировать контакт" in t for t in texts)
     for btn in REMOVED_BUTTONS:
         assert all(btn not in t for t in texts), f"кнопка «{btn}» должна быть убрана"
-    assert len(flat) == 2
-    write_btn = next(b for b in flat if "Написать" in (b.text or ""))
+    assert len(flat) == 1
+    write_btn = flat[0]
     assert write_btn.url == "https://t.me/demo_recruiter"
-    copy_btn = next(b for b in flat if "Копировать" in (b.text or ""))
-    assert copy_btn.copy_text and copy_btn.copy_text.text == "@demo_recruiter"
 
 
 def test_keyboard_for_userid_contact_has_no_copy():
@@ -359,13 +356,12 @@ def test_facts_rows_shared_between_renderers():
 
 
 def test_keyboard_main_button_is_primary_style():
-    """Bot API 9.4: главная кнопка — акцентная (primary), копирование — нейтральная."""
+    """Bot API 9.4: единственная кнопка «Написать» — акцентная (primary)."""
     kb = inline_keyboard(DEMO)
     flat = [b for row in kb.inline_keyboard for b in row]
-    write_btn = next(b for b in flat if "Написать" in (b.text or ""))
-    copy_btn = next(b for b in flat if "Копировать" in (b.text or ""))
-    assert write_btn.style == "primary"
-    assert not copy_btn.style  # дефолтный стиль приложения
+    assert len(flat) == 1
+    assert "Написать" in (flat[0].text or "")
+    assert flat[0].style == "primary"
 
 
 def test_keyboard_contacts_by_button_fallback():
@@ -392,3 +388,29 @@ def test_keyboard_no_button_for_autocard_without_contacts():
     v = Vacancy(job_id=1, slug="x", url="https://hirify.me/jobs/1-x")
     kb = inline_keyboard(v)
     assert not kb.inline_keyboard
+
+
+def test_no_source_label_in_manual_and_channel_cards():
+    """Решение 13.11: карточка из своего текста не подписывается «из вашего
+    текста», карточка из ТГ-канала не называет канал-источник — в шапке
+    остаётся только компания (разделы hirify свои подписи сохраняют)."""
+    from app.textparse import parse_vacancy_text
+
+    text = ("Ищем Senior Rust Developer в компанию Vega Protocol, remote,\n"
+            "$3000-5000. Стек: Rust, Solana. Писать: @hr_vega")
+    # 1) свой текст (дефолт parse_vacancy_text)
+    v = parse_vacancy_text(text)
+    assert v.feed_key == "manual" and v.feed_label == ""
+    for html in (render_rich_html(v), render_classic_html(v)):
+        assert "из вашего текста" not in html
+        assert "Vega Protocol" in html
+
+    # 2) пост из канала: feed_key маршрутизируется, метка пуста
+    v2 = parse_vacancy_text(text, feed_key="tg_cpa_people", feed_label="")
+    assert v2.feed_key == "tg_cpa_people" and v2.feed_label == ""
+    for html in (render_rich_html(v2), render_classic_html(v2)):
+        assert "Cpa People" not in html and "cpa_people" not in html
+
+    # 3) раздел hirify подпись сохраняет (категория, не источник)
+    v3 = parse_vacancy_text(text, feed_key="remote", feed_label="🏠 Удалёнка")
+    assert "Удалёнка" in render_rich_html(v3)

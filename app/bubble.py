@@ -56,7 +56,8 @@ _BUBBLE_CSS = (
     ".jc .r:last-child{border-bottom:none}"
     ".jc .r span{color:var(--tg-theme-hint-color)}"
     ".jc .r b{text-align:right}"
-    ".jc .ds{margin:8px 0 2px;font-size:.95em;white-space:pre-line;overflow-wrap:anywhere}"
+    ".jc .ds{margin:8px 0 2px;font-size:.95em;white-space:pre-line;overflow-wrap:anywhere;"
+    "color:var(--tg-theme-text-color)}"
     ".jc .pn{background:var(--tg-theme-secondary-bg-color);"
     "border-left:3px solid var(--tg-theme-link-color);border-radius:6px 10px 10px 6px;"
     "padding:7px 11px;margin:9px 0 2px;"
@@ -66,9 +67,7 @@ _BUBBLE_CSS = (
     ".jc .ex{margin-top:6px;font-size:.84em;color:var(--tg-theme-hint-color);"
     "user-select:text;-webkit-user-select:text;overflow-wrap:anywhere}"
     ".jc .bs{display:flex;gap:8px;margin:11px 0 2px}"
-    ".jc .bs .cta{flex:1.7 1 0}"
-    ".jc .bs .cp{flex:1 1 0;background:var(--tg-theme-secondary-bg-color);"
-    "color:var(--tg-theme-text-color)}"
+    ".jc .bs .cta{flex:1 1 0}"
     ".jc .ft{margin-top:9px;font-size:.78em;color:var(--tg-theme-hint-color)}"
     "</style>"
 )
@@ -105,16 +104,11 @@ def _buttons_html(v: Vacancy) -> str:
     if not primary or primary.kind not in ("username", "channel"):
         return ""
     url = _js_arg(primary.url)
+    # одна кнопка-действие: «Копировать контакт» убрана (решение владельца 13.11)
     btns = [
         f'<button class="cta" onclick="TelegramWidget.openTelegramLink(\'{url}\')">'
         f"✉️ Написать рекрутеру</button>",
     ]
-    if primary.kind == "username":
-        handle = _js_arg(primary.display)
-        btns.append(
-            f'<button class="cp" onclick="TelegramWidget.copyText(\'{handle}\')">'
-            f"📋 Копировать контакт</button>",
-        )
     return '<div class="bs">' + "".join(btns) + "</div>"
 
 

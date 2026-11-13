@@ -688,7 +688,10 @@ class Monitor:
         v = parse_vacancy_text(
             text,
             date_posted=str(item.get("created_at") or "")[:10],
-            feed_key=feed.key, feed_label=feed.label,
+            # feed_key — маршрут рассылки (настройки /settings), а вот метку
+            # источника в карточку НЕ кладём: «из какого канала вакансия» в
+            # шапке не упоминается (решение владельца 13.11)
+            feed_key=feed.key, feed_label="",
         )
         self.db.update_job_parsed(
             job_id, title=v.title, company=v.company, salary=v.salary,

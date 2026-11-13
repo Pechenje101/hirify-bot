@@ -45,11 +45,13 @@ def test_bubble_structure():
 
 
 def test_bubble_buttons_inside_widget():
-    """Для @username — кнопки с openTelegramLink/copyText внутри виджета."""
+    """Для @username — единственная кнопка-действие с openTelegramLink
+    (копирование убрано 13.11)."""
     html = render_bubble_html(DEMO)
     assert "TelegramWidget.openTelegramLink('https://t.me/demo_recruiter')" in html
-    assert "TelegramWidget.copyText('@demo_recruiter')" in html
-    assert "Написать рекрутеру" in html and "Копировать контакт" in html
+    assert "TelegramWidget.copyText" not in html
+    assert "Написать рекрутеру" in html
+    assert "Копировать контакт" not in html
 
 
 def test_bubble_userid_contact_no_inner_buttons():
