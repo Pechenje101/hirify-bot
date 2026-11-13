@@ -307,6 +307,12 @@ class Config:
     # Задаётся и через окружение, и командой /setchannel (хранится в БД,
     # перекрывает окружение). 0 = модерация выключена (обычная рассылка).
     post_channel_id: int = field(default_factory=lambda: _get_int("POST_CHANNEL_ID", 0))
+    # Час (МСК) вечернего дайджеста канала — сводка постов дня одним
+    # сообщением. 0 = выключить. Маркер даты в БД — раны самозамещаются.
+    chan_digest_hour: int = field(default_factory=lambda: _get_int("CHAN_DIGEST_HOUR", 21))
+    # Час (МСК) воскресной недельной аналитики владельцу (посты/отклики/топ).
+    # 0 = только по команде /week.
+    week_report_hour: int = field(default_factory=lambda: _get_int("WEEK_REPORT_HOUR", 20))
     db_path: Path = field(default_factory=lambda: BASE_DIR / os.getenv("DB_PATH", "data/hirify_bot.db"))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     debug_dump_dir: Path = field(default_factory=lambda: BASE_DIR / "debug")

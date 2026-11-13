@@ -29,6 +29,7 @@ BOT_COMMANDS = [
     BotCommand(command="fresh", description="Проверить вакансии сейчас"),
     BotCommand(command="digest", description="Дайджест последних вакансий"),
     BotCommand(command="pending", description="Очередь модерации канала"),
+    BotCommand(command="week", description="Недельная аналитика канала"),
     BotCommand(command="settings", description="Разделы, вид карточек, тихий режим"),
     BotCommand(command="test", description="Демо-карточка вакансии"),
     BotCommand(command="stats", description="Статистика"),
@@ -82,6 +83,14 @@ async def run() -> None:
         await bot.set_my_commands(BOT_COMMANDS)
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось установить меню команд: %s", e)
+    # username бота — для кнопок «📨 Откликнуться» на постах канала
+    # (deep-link t.me/<бот>?start=job_<id>); кеш в БД, раны его перечитывают
+    try:
+        me = await bot.get_me()
+        if me.username:
+            db.set_setting("bot_username", me.username)
+    except Exception as e:  # noqa: BLE001 — кнопка отклика не критична
+        log.warning("Не удалось узнать username бота: %s", e)
 
     # фоновый мониторинг + приём команд
     monitor_task = asyncio.create_task(monitor.run_forever())

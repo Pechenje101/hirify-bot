@@ -15,8 +15,9 @@ from app.config import Config  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
 from app.moderation import (  # noqa: E402
-    auto_bind_channel, moderation_active, moderation_target, panel_keyboard,
-    panel_text, publish_job, queue_for_moderation,
+    auto_bind_channel, close_job, delete_post, manage_keyboard,
+    moderation_active, moderation_target, panel_keyboard, panel_text,
+    publish_job, queue_for_moderation,
 )
 from app.parsing import vacancy_from_payload, vacancy_to_payload  # noqa: E402
 from app.services import Services  # noqa: E402
@@ -39,15 +40,38 @@ class FakeSender:
         self.vacancies: list = []
         self.displays: list[str] = []
         self.texts: list[tuple[int, str, object]] = []
+        self.extra_rows: list = []          # ряды кнопок у постов в канал
         self.fail_vacancy = fail_vacancy
+        # «Bot»: get_me для кнопки отклика, edit/delete для закрытия/удаления
+        class _Bot:
+            username = "hirify_bot"
+            edited: list = []
+            deleted: list = []
 
-    async def send_vacancy(self, chat_id, v, *, silent=False, display="auto"):
+            async def get_me(self):
+                class _Me:
+                    username = self.username
+                return _Me()
+
+            async def edit_message_text(self, chat_id, message_id, text, **kw):
+                self.edited.append((chat_id, message_id, text, kw.get("reply_markup")))
+                return True
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+                return True
+
+        self.bot = _Bot()
+
+    async def send_vacancy(self, chat_id, v, *, silent=False, display="auto",
+                           extra_row=None, want_message=False):
         if self.fail_vacancy:
             raise RuntimeError("bot is not admin")
         self.sent.append((chat_id, v.title))
         self.vacancies.append(v)
         self.displays.append(display)
-        return "classic"
+        self.extra_rows.append(extra_row)
+        return ("classic", 4242) if want_message else "classic"
 
     async def send_text(self, chat_id, html, markup=None):
         self.texts.append((chat_id, html, markup))
@@ -104,7 +128,7 @@ def test_payload_garbage():
 def test_db_moderation_columns_and_queue():
     db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
     cols = {r[1] for r in db.conn.execute("PRAGMA table_info(jobs)")}
-    assert {"mod_status", "payload"} <= cols
+    assert {"mod_status", "payload", "dedup_hash", "chan_msg_id", "posted_at"} <= cols
 
     for jid, fs in ((1, "2026-11-11T10:00:00"), (2, "2026-11-12T10:00:00"),
                     (3, "2026-11-13T10:00:00")):
@@ -116,16 +140,19 @@ def test_db_moderation_columns_and_queue():
     db.save_moderation(2, "{}")
     db.save_moderation(3, "{}")
     db.set_mod(2, "no")
-    db.set_mod(3, "posted")
+    db.mark_posted(3, 777)
+    db.mark_channel_post_gone(3, "closed")
 
     # FIFO: старые сверху (1 остался в очереди)
     assert [r["job_id"] for r in db.pending_moderation()] == [1]
     st = db.moderation_stats()
-    assert st == {"queue": 1, "posted": 1, "rejected": 1}
+    assert st == {"queue": 1, "posted": 0, "closed": 1, "deleted": 0, "rejected": 1}
 
-    # save_moderation пишет payload ровно один раз
+    # save_moderation пишет payload ровно один раз; mark_posted — время и id поста
     row = db.get_job(1)
     assert row["payload"] == "{}" and row["mod_status"] == "queue"
+    closed = db.get_job(3)
+    assert closed["posted_at"] != "" and closed["chan_msg_id"] == 0
     db.close()
 
 
@@ -257,7 +284,14 @@ def test_publish_job_ok_and_full_card():
     sent_v = sender.vacancies[0]
     assert sent_v.description == v.description
     assert sent_v.contacts[0].value == v.contacts[0].value
-    assert db.get_job(101)["mod_status"] == "posted"
+    # КНОПКА ОТКЛИКА: ряд доп. кнопок у поста + deep-link на этого бота
+    row = sender.extra_rows[0]
+    assert row and row[0].url == f"https://t.me/hirify_bot?start=job_101"
+    assert row[0].text == "📨 Откликнуться"
+    # id поста и время записаны (закрыть/удалить/дайджест дня)
+    job = db.get_job(101)
+    assert job["mod_status"] == "posted" and job["chan_msg_id"] == 4242
+    assert job["posted_at"] != ""
     # повторное нажатие — уже решено
     assert asyncio.run(publish_job(101, services)) == "already"
     db.close()
@@ -299,6 +333,55 @@ def test_publish_job_outcomes():
     db.save_moderation(302, vacancy_to_payload(v2))
     assert asyncio.run(publish_job(302, services_fail)) == "fail"
     assert db.get_job(302)["mod_status"] == "queue"
+    db.close()
+
+
+def test_close_and_delete_post():
+    """Закрытие правит пост в канале (замочек, кнопка отклика снята),
+    удаление убирает пост; оба статуса выбывают из дайджеста дня."""
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    sender = FakeSender()
+    services = make_services(db=db, sender=sender)
+    v = sample_vacancy(501)
+    db.add_job(501, v.slug, v.url, title=v.title)
+    db.save_moderation(501, vacancy_to_payload(v))
+    assert asyncio.run(publish_job(501, services)) == "ok"
+
+    # ЗАКРЫТИЕ: бот редактирует свой пост — текст + замочек, кнопки сняты
+    assert asyncio.run(close_job(501, services)) == "ok"
+    chat, mid, text, markup = sender.bot.edited[0]
+    assert chat == CHANNEL and mid == 4242
+    assert "Вакансия закрыта" in text and "ChainX" in text and markup is None
+    assert db.get_job(501)["mod_status"] == "closed"
+    assert asyncio.run(close_job(501, services)) == "already"
+    # закрытая не удаляется (панель управления уже снята)
+    assert asyncio.run(delete_post(501, services)) == "already"
+
+    # УДАЛЕНИЕ: отдельная вакансия с живым постом
+    v2 = sample_vacancy(502)
+    db.add_job(502, v2.slug, v2.url, title=v2.title)
+    db.save_moderation(502, vacancy_to_payload(v2))
+    asyncio.run(publish_job(502, services))
+    assert asyncio.run(delete_post(502, services)) == "ok"
+    assert sender.bot.deleted == [(CHANNEL, 4242)]
+    job = db.get_job(502)
+    assert job["mod_status"] == "deleted" and job["chan_msg_id"] == 0
+    # из дайджеста дня оба выбывают (дальше — test_reports)
+    db.close()
+
+
+def test_manage_keyboard_and_applies():
+    """Панель управления постом + счёт уникальных откликов."""
+    kb = manage_keyboard(123)
+    datas = {b.callback_data for row in kb.inline_keyboard for b in row}
+    assert datas == {"mod:close:123", "mod:del:123"}
+
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
+    # первый отклик новый, повторные того же юзера — нет; другой юзер — да
+    assert db.add_apply(123, 10) is True
+    assert db.add_apply(123, 10) is False
+    assert db.add_apply(123, 11) is True
+    assert db.applies_count(123) == 2
     db.close()
 
 

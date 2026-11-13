@@ -38,8 +38,13 @@ DEFAULT_DISPLAY = "auto"
 RETRYABLE_STATUSES = ("send_failed", "fetch_failed", "new")
 
 # Для дайджеста (/digest) не показываем: посты-не-вакансии (болтовня каналов),
-# скам и fetch_failed — страницы, которые так и не прочитали (данных нет).
-DIGEST_HIDDEN_STATUSES = ("skipped_not_vacancy", "skipped_scam", "fetch_failed")
+# скам, fetch_failed (страницы, которые так и не прочитали), дубли контента
+# (та же вакансия уже доставлялась из другого источника).
+DIGEST_HIDDEN_STATUSES = ("skipped_not_vacancy", "skipped_scam", "fetch_failed", "skipped_duplicate")
+
+# Дедуп по содержимому работает в этом окне: репосты HR случаются за часы-дни;
+# старше — уже не дубли, а «возобновили набор» (правильное решение — показать).
+DEDUP_WINDOW_DAYS = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -68,6 +73,15 @@ CREATE TABLE IF NOT EXISTS subscribers (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- отклики читателей канала (кнопка «Откликнуться» на посте → deep-link в бота):
+-- пара (job_id, user_id) уникальна — считаем уникальных откликнувшихся, а не клики
+CREATE TABLE IF NOT EXISTS applies (
+    job_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    ts     TEXT NOT NULL,
+    PRIMARY KEY (job_id, user_id)
 );
 """
 
@@ -104,6 +118,22 @@ class Database:
                 self.conn.execute("ALTER TABLE jobs ADD COLUMN mod_status TEXT NOT NULL DEFAULT ''")
             if "payload" not in cols:
                 self.conn.execute("ALTER TABLE jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
+            # миграция старых баз: дедуп контента + публикация в канал владельца:
+            # dedup_hash — отпечаток «заголовок+компания» для межисточникового
+            # дедупа (копии одной вакансии в разных ТГ-каналах имеют разные id);
+            # chan_msg_id — id поста в канале (закрыть вакансию/удалить пост,
+            # ссылки в вечернем дайджесте); posted_at — время публикации
+            # (дайджест дня и недельная аналитика)
+            for name, ddl in (
+                ("dedup_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("chan_msg_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("posted_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_dedup ON jobs(dedup_hash)"
+            )
             # миграция старых баз: настройки подписчика (feeds, silent, display)
             scols = {r[1] for r in self.conn.execute("PRAGMA table_info(subscribers)")}
             if "feeds" not in scols:
@@ -169,7 +199,8 @@ class Database:
         with _LOCK:
             row = self.conn.execute(
                 "SELECT job_id, slug, url, title, company, salary, tg_contacts,"
-                " attempts, first_seen, sent_at, status, mod_status, payload"
+                " attempts, first_seen, sent_at, status, mod_status, payload,"
+                " dedup_hash, chan_msg_id, posted_at"
                 " FROM jobs WHERE job_id=?",
                 (job_id,),
             ).fetchone()
@@ -293,6 +324,33 @@ class Database:
                     pass
         return removed
 
+    # ---------- дедуп контента ----------
+
+    def set_dedup_hash(self, job_id: int, dedup_hash: str) -> None:
+        """Запомнить отпечаток содержимого вакансии (для межисточникового дедупа).
+        Пишется перед доставкой: если копия уже ушла — эта станет skipped_duplicate."""
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET dedup_hash=? WHERE job_id=?", (dedup_hash, job_id)
+            )
+            self.conn.commit()
+
+    def duplicate_of(self, dedup_hash: str, job_id: int) -> int | None:
+        """job_id УЖЕ ДОСТАВЛЕННОЙ вакансии с тем же отпечатком (иначе None).
+
+        Смотрим только 'sent' (дошла до людей) в окне DEDUP_WINDOW_DAYS:
+        пропущенные копии не считаются, старьё — «возобновили набор»."""
+        if not dedup_hash:
+            return None
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=DEDUP_WINDOW_DAYS)).isoformat(timespec="seconds")
+        with _LOCK:
+            row = self.conn.execute(
+                "SELECT job_id FROM jobs WHERE dedup_hash=? AND job_id!=?"
+                " AND status='sent' AND first_seen>=? ORDER BY job_id LIMIT 1",
+                (dedup_hash, job_id, cutoff),
+            ).fetchone()
+        return row["job_id"] if row else None
+
     # ---------- модерация публикаций ----------
 
     def save_moderation(self, job_id: int, payload: str, mod_status: str = "queue") -> None:
@@ -313,6 +371,27 @@ class Database:
             )
             self.conn.commit()
 
+    def mark_posted(self, job_id: int, chan_msg_id: int = 0) -> None:
+        """Пост в канале вышел: время + id поста (закрыть вакансию, удалить пост,
+        ссылки в вечернем дайджесте)."""
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET mod_status='posted', posted_at=?, chan_msg_id=?"
+                " WHERE job_id=?",
+                (_now(), chan_msg_id, job_id),
+            )
+            self.conn.commit()
+
+    def mark_channel_post_gone(self, job_id: int, mod_status: str) -> None:
+        """Поста в канале больше нет: 'closed' (текст дополнен «🔒 закрыта») или
+        'deleted' (сообщение удалено) — из дайджеста дня оба выбывают."""
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET mod_status=?, chan_msg_id=0 WHERE job_id=?",
+                (mod_status, job_id),
+            )
+            self.conn.commit()
+
     def pending_moderation(self, limit: int = 10) -> list[dict]:
         """Очередь модерации (старые сверху — FIFO, как пришли)."""
         with _LOCK:
@@ -325,7 +404,7 @@ class Database:
         return [dict(r) for r in rows]
 
     def moderation_stats(self) -> dict:
-        """Счётчики решений модерации — для шапки /pending."""
+        """Счётчики решений модерации — для шапки /pending и недельного отчёта."""
         with _LOCK:
             rows = self.conn.execute(
                 "SELECT mod_status, COUNT(*) AS n FROM jobs"
@@ -333,6 +412,7 @@ class Database:
             ).fetchall()
         d = {r["mod_status"]: r["n"] for r in rows}
         return {"queue": d.get("queue", 0), "posted": d.get("posted", 0),
+                "closed": d.get("closed", 0), "deleted": d.get("deleted", 0),
                 "rejected": d.get("no", 0)}
 
     def stats(self) -> dict:
@@ -374,7 +454,75 @@ class Database:
             ),
             # «Слишком старые»: опубликованы раньше границы свежести — не присылались
             "stale": by_status.get("skipped_stale", 0),
+            # Дубли контента: та же вакансия уже доставлялась из другого источника
+            # (межисточниковый дедуп — в комментариях к parsing.dedup_hash)
+            "duplicates": by_status.get("skipped_duplicate", 0),
         }
+
+    # ---------- отклики (кнопка «Откликнуться» на посте в канале) ----------
+
+    def add_apply(self, job_id: int, user_id: int) -> bool:
+        """Зафиксировать отклик читателя канала (deep-link /start job_…).
+        Возвращает True, если отклик новый (повторные клики того же человека
+        не накручивают счётчик — пара job_id+user_id уникальна)."""
+        with _LOCK:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO applies (job_id, user_id, ts) VALUES (?,?,?)",
+                (job_id, user_id, _now()),
+            )
+            self.conn.commit()
+        return bool(cur.rowcount)
+
+    def applies_count(self, job_id: int) -> int:
+        """Уникальных откликнувшихся на вакансию (счётчик у поста/в отчётах)."""
+        with _LOCK:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM applies WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def applies_since(self, since_iso: str) -> int:
+        """Всего откликов за окно (недельная аналитика)."""
+        with _LOCK:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM applies WHERE ts>=?", (since_iso,)
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def top_applied(self, since_iso: str, limit: int = 3) -> list[dict]:
+        """Топ вакансий по откликам за окно: [{job_id, title, company, clicks}]."""
+        with _LOCK:
+            rows = self.conn.execute(
+                "SELECT a.job_id AS job_id, COUNT(*) AS clicks, j.title AS title,"
+                " j.company AS company FROM applies a"
+                " LEFT JOIN jobs j ON j.job_id = a.job_id"
+                " WHERE a.ts>=? GROUP BY a.job_id ORDER BY clicks DESC, a.job_id LIMIT ?",
+                (since_iso, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- аналитика канала (дайджест дня / недельный отчёт) ----------
+
+    def posted_since(self, since_iso: str, limit: int = 10) -> list[dict]:
+        """Активные посты канала за окно (старые→новые, как читается канал):
+        только 'posted' с живым chan_msg_id — закрытые и удалённые выбывают."""
+        with _LOCK:
+            rows = self.conn.execute(
+                "SELECT job_id, title, company, salary, chan_msg_id, posted_at"
+                " FROM jobs WHERE mod_status='posted' AND chan_msg_id>0"
+                " AND posted_at>=? ORDER BY posted_at ASC, job_id ASC LIMIT ?",
+                (since_iso, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def posted_count_since(self, since_iso: str) -> int:
+        """Сколько постов вышло за окно (posted + closed: удалённые не считаем)."""
+        with _LOCK:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE posted_at>=?"
+                " AND mod_status IN ('posted','closed')", (since_iso,)
+            ).fetchone()
+        return int(row["n"] or 0)
 
     # ---------- подписчики ----------
 

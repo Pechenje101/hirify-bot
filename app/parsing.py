@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -595,6 +596,41 @@ def vacancy_to_payload(v: Vacancy) -> str:
         ],
     }
     return json.dumps(d, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- дедуп контента
+
+_NONWORD_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _norm_text(s: str) -> str:
+    """Нормализация для дедупа: нижний регистр, ё→е, всё не-буквоцифровое —
+    в пробел (эмодзи, пунктуация, тире), пробелы схлопнуты, хвост до 60."""
+    s = (s or "").lower().replace("ё", "е")
+    s = _NONWORD_RE.sub(" ", s)
+    return " ".join(s.split())[:60]
+
+
+def dedup_hash(v: Vacancy) -> str:
+    """Отпечаток СОДЕРЖИМОГО вакансии — дедуп между источниками.
+
+    Один и тот же пост HR раскидывает по нескольким каналам: job_id у копий
+    разный (id поста в каждом канале свой), поэтому дедуп по id их не видит,
+    а дубли в канале владельца — потеря доверия. Ключ: нормализованные
+    заголовок + компания (у репостов они совпадают); нет компании — заголовок
+    + первый контакт (один и тот же рекрутер). Пустой заголовок — «» (дедуп
+    не срабатывает, надёжнее промолчать, чем съесть уникальные вакансии).
+    """
+    title = _norm_text(v.title)
+    if not title:
+        return ""
+    company = _norm_text(v.company)
+    if company:
+        key = f"{title}|{company}"
+    else:
+        contact = next((c.value for c in v.contacts if c.value), "")
+        key = f"{title}|{_norm_text(contact)}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
 def vacancy_from_payload(raw: str | None) -> Optional[Vacancy]:

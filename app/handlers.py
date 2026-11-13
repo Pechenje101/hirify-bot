@@ -21,9 +21,13 @@ from .digest import (
     render_digest, selection_keyboard, selection_text, sessions, suggest,
 )
 from .hirify import HirifyAutomationError, HirifyRestrictedError
-from .moderation import auto_bind_channel, moderation_target, panel_keyboard, panel_text, publish_job
+from .moderation import (
+    auto_bind_channel, close_job, delete_post, manage_keyboard,
+    moderation_target, panel_keyboard, panel_text, publish_job,
+)
 from .monitor import POLL_JITTER
-from .parsing import _api_contacts
+from .parsing import _api_contacts, vacancy_from_payload
+from .reports import render_week_report
 from .services import Services
 from .textparse import looks_like_vacancy, parse_vacancy_text
 
@@ -137,10 +141,34 @@ async def _ensure_admin(message: Message, services: Services) -> bool:
 # ---------------------------------------------------------------- команды
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, services: Services):
+async def cmd_start(message: Message, command: CommandObject, services: Services):
     if not await _ensure_private(message):
         return
     services.db.add_subscriber(message.chat.id, message.from_user.username if message.from_user else None)
+    # deep-link из канала: кнопка «📨 Откликнуться» на посте ведёт сюда
+    # (t.me/<бот>?start=job_<id>) — читатель канала получает полную карточку
+    # и попадает в воронку бота; отклик фиксируется (уникальные пользователи)
+    payload = (command.args or "").strip()
+    if payload.startswith("job_"):
+        jid = 0
+        try:
+            jid = int(payload[4:])
+        except ValueError:
+            pass
+        job = services.db.get_job(jid) if jid else None
+        v = vacancy_from_payload(job.get("payload") or "") if job else None
+        if v is not None:
+            if message.from_user:
+                services.db.add_apply(jid, message.from_user.id)
+            await message.answer(texts.APPLY_GREETING, parse_mode="HTML",
+                                 disable_web_page_preview=True)
+            sub = services.db.subscriber(message.chat.id)
+            await services.sender.send_vacancy(
+                message.chat.id, v,
+                display=sub["display"] if sub else DEFAULT_DISPLAY,
+            )
+            return
+        # вакансию не нашли (вне окна чистки БД / битый deep-link) — обычный старт
     await message.answer(
         texts.WELCOME.format(rhythm=texts.poll_rhythm(services.cfg.poll_minutes)),
         parse_mode="HTML", disable_web_page_preview=True,
@@ -289,7 +317,8 @@ async def cmd_stats(message: Message, services: Services):
     await message.answer(
         texts.STATS_TMPL.format(**{k: s.get(k, 0) for k in
                                    ("total", "sent", "sent_today", "skipped", "filtered",
-                                    "stale", "failed", "fetch_failed", "send_failed")}),
+                                    "stale", "failed", "fetch_failed", "send_failed",
+                                    "duplicates")}),
         parse_mode="HTML",
     )
 
@@ -691,8 +720,16 @@ async def on_moderation_button(cb: CallbackQuery, services: Services):
         if out in ("ok", "already"):
             job = services.db.get_job(job_id) or {}
             title = html_mod.escape(str(job.get("title") or "вакансия"))
-            note = "✅ Опубликовано в канал" if out == "ok" else "☑️ Уже опубликована"
-            await _mod_done(cb, f"{note}\n<b>{title}</b>", services)
+            applies = services.db.applies_count(job_id)
+            if out == "ok":
+                note = f"✅ Опубликовано в канал\n<b>{title}</b>"
+                if int(job.get("chan_msg_id") or 0):
+                    note += f"\nПост №{job['chan_msg_id']} · откликов: {applies}"
+            else:
+                note = f"☑️ Уже опубликована\n<b>{title}</b>"
+            # панель управления постом (закрыть/удалить) — только для живого поста
+            markup = manage_keyboard(job_id) if int(job.get("chan_msg_id") or 0) else None
+            await _mod_done(cb, note, services, markup)
             await cb.answer("✅ Опубликовано" if out == "ok" else "Уже опубликована")
         elif out == "nochan":
             await cb.answer("Канал не задан: /setchannel <@имя или -100…>", show_alert=True)
@@ -702,6 +739,30 @@ async def on_moderation_button(cb: CallbackQuery, services: Services):
             await cb.answer("Данные карточки не сохранились — пропустите вакансию", show_alert=True)
         else:
             await cb.answer("Не получилось отправить (бот — админ канала?) — попробуйте позже", show_alert=True)
+        return
+    if action == "close":
+        out = await close_job(job_id, services)
+        if out == "ok":
+            job = services.db.get_job(job_id) or {}
+            await _mod_done(cb, "🔒 Вакансия закрыта\n<b>" +
+                            html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
+            await cb.answer("🔒 Закрыта — замочек в посте, кнопка отклика снята")
+        elif out == "already":
+            await cb.answer("Уже закрыта/решена")
+        else:
+            await cb.answer("Не получилось закрыть (пост ещё жив?) — попробуйте позже", show_alert=True)
+        return
+    if action == "del":
+        out = await delete_post(job_id, services)
+        if out == "ok":
+            job = services.db.get_job(job_id) or {}
+            await _mod_done(cb, "🗑 Пост удалён из канала\n<b>" +
+                            html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
+            await cb.answer("🗑 Пост удалён")
+        elif out == "already":
+            await cb.answer("Поста уже нет")
+        else:
+            await cb.answer("Не получилось удалить — попробуйте позже", show_alert=True)
         return
     if action == "no":
         services.db.set_mod(job_id, "no")
@@ -713,12 +774,13 @@ async def on_moderation_button(cb: CallbackQuery, services: Services):
     await cb.answer()
 
 
-async def _mod_done(cb: CallbackQuery, text: str, services: Services) -> None:
-    """Закрыть панель: убрать кнопки, оставить вердикт (сообщение могли удалить — не беда)."""
+async def _mod_done(cb: CallbackQuery, text: str, services: Services, markup=None) -> None:
+    """Закрыть панель: убрать кнопки (или сменить на панель управления),
+    оставить вердикт (сообщение могли удалить — не беда)."""
     if cb.message is None:
         return
     try:
-        await cb.message.edit_text(text, parse_mode="HTML")
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
     except Exception:  # noqa: BLE001
         pass
 
@@ -735,7 +797,7 @@ async def cmd_pending(message: Message, services: Services):
     header = (
         f"🎛 <b>Модерация канала</b>\n"
         f"В очереди: <b>{st['queue']}</b> · опубликовано {st['posted']}"
-        f" · отклонено {st['rejected']}\n\n"
+        f" · закрыто {st['closed']} · отклонено {st['rejected']}\n\n"
     )
     if not rows:
         extra = "" if moderation_target(services.cfg, services.db) else (
@@ -850,6 +912,21 @@ async def cmd_setchannel(message: Message, command: CommandObject, services: Ser
         " «❌ Отклонить». Пост в канале — нативный, без «Переслано от…».\n"
         "Очередь решений: /pending · выключить: /setchannel off",
         parse_mode="HTML",
+    )
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message, services: Services):
+    """Недельная аналитика конвейера канала — по требованию (воскресенье
+    20:00 МСК шлётся само: WEEK_REPORT_HOUR)."""
+    if not await _ensure_private(message):
+        return
+    if not await _is_admin_guard(message, services):
+        return
+    from .reports import _msk_now
+    await message.answer(
+        render_week_report(services.db, _msk_now()),
+        parse_mode="HTML", disable_web_page_preview=True,
     )
 
 

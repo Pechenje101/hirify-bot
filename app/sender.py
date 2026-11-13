@@ -51,19 +51,27 @@ class VacancySender:
         *,
         silent: bool = False,
         display: str = DEFAULT_DISPLAY,
-    ) -> str:
+        extra_row: list | None = None,
+        want_message: bool = False,
+    ):
         """Отправляет карточку выбранным видом. Возвращает, чем отправили:
-        'bubble' | 'rich' | 'classic'.
+        'bubble' | 'rich' | 'classic'; при want_message=True — кортеж
+        (вид, message_id) — id поста нужен конвейеру канала (закрыть вакансию,
+        удалить пост, ссылки в вечернем дайджесте).
 
         silent=True — доставить без звука (disable_notification, настройка
         подписчика из /settings).
+        extra_row — дополнительный ряд кнопок ПОД клавиатурой карточки
+        (кнопка «📨 Откликнуться» на посте в канале владельца).
         """
         sent_with = "classic"
+        message_id = 0
         plan = self._plan(display)
         for i, (mode, sender) in enumerate(plan):
             try:
-                await sender(chat_id, v, silent)
+                msg = await sender(chat_id, v, silent, extra_row)
                 sent_with = mode
+                message_id = int(getattr(msg, "message_id", 0) or 0)
                 if mode == "rich":
                     self._rich_fails = 0
                 elif mode == "bubble":
@@ -78,9 +86,21 @@ class VacancySender:
         # или они молча откатываются к rich/классике (и почему — строками выше)
         log.info("job %s → чат %s: доставлено видом %s (выбрано %s)",
                  v.job_id, chat_id, sent_with, display)
-        return sent_with
+        return (sent_with, message_id) if want_message else sent_with
 
     # ------------------------------------------------------------ план
+
+    @staticmethod
+    def _markup_with(v: Vacancy, extra_row: list | None):
+        """Клавиатура карточки + дополнительный ряд (кнопка отклика в канале).
+        Кнопок карточки может не быть вовсе (контакты в тексте) — тогда ряд
+        отклика становится единственным."""
+        base = inline_keyboard(v)
+        rows = [list(r) for r in base.inline_keyboard] if base else []
+        if extra_row:
+            rows.append(list(extra_row))
+        from aiogram.types import InlineKeyboardMarkup
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
     def _plan(self, display: str) -> list[tuple[str, object]]:
         """Цепочка попыток для выбранного вида: bubble → rich → classic."""
@@ -122,7 +142,7 @@ class VacancySender:
 
     # ------------------------------------------------------------ bubble
 
-    async def _send_widget(self, chat_id: int, v: Vacancy, silent: bool) -> None:
+    async def _send_widget(self, chat_id: int, v: Vacancy, silent: bool, extra_row: list | None = None):
         from .widget_api import SendWidget
 
         html = render_bubble_html(v)
@@ -133,11 +153,11 @@ class VacancySender:
         # Кнопочный режим (контактов нет вообще): под виджет уходит та же
         # инлайн-клавиатура с «👤 Показать контакты» (callback).
         markup = None
-        if v.contacts_by_button:
-            markup = inline_keyboard(v)
+        if v.contacts_by_button or extra_row:
+            markup = self._markup_with(v, extra_row)
         elif v.primary_contact and v.primary_contact.kind == "user_id":
-            markup = inline_keyboard(v)
-        await self._with_retry(
+            markup = self._markup_with(v, None)
+        return await self._with_retry(
             lambda: self.bot(
                 SendWidget(
                     chat_id=chat_id,
@@ -151,7 +171,7 @@ class VacancySender:
 
     # ------------------------------------------------------------ rich
 
-    async def _send_rich(self, chat_id: int, v: Vacancy, silent: bool) -> None:
+    async def _send_rich(self, chat_id: int, v: Vacancy, silent: bool, extra_row: list | None = None):
         from aiogram.types import InputRichMessage
 
         # лимит Bot API 10.1+ — 32768 символов html: описание вкладываем целиком
@@ -159,11 +179,11 @@ class VacancySender:
         html = render_rich_html(v)
         # ВАЖНО: без reply_markup — кнопки уже внутри rich-разметки (tg-button),
         # иначе у сообщения были бы дублирующиеся ряды кнопок.
-        # ИСКЛЮЧЕНИЕ — кнопочный режим: контактов нет → внутри разметки кнопок
-        # не оказалось; единственная кнопка «👤 Показать контакты» (callback)
-        # может быть только инлайн-клавиатурой.
-        markup = inline_keyboard(v) if v.contacts_by_button else None
-        await self._with_retry(
+        # ИСКЛЮЧЕНИЕ — кнопочный режим (контактов нет → единственная кнопка
+        # «👤 Показать контакты» может быть только инлайн-клавиатурой) и ряд
+        # отклика для поста в канале владельца (extra_row).
+        markup = self._markup_with(v, extra_row) if (v.contacts_by_button or extra_row) else None
+        return await self._with_retry(
             lambda: self.bot.send_rich_message(
                 chat_id=chat_id,
                 rich_message=InputRichMessage(html=html),
@@ -174,17 +194,17 @@ class VacancySender:
 
     # ------------------------------------------------------------ классика
 
-    async def _send_classic(self, chat_id: int, v: Vacancy, silent: bool) -> None:
+    async def _send_classic(self, chat_id: int, v: Vacancy, silent: bool, extra_row: list | None = None):
         # автобюджет под 4096 видимых символов: полное описание в expandable-цитате
         text = render_classic_html(v)
-        await self._with_retry(
+        return await self._with_retry(
             lambda: self.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 disable_notification=silent,
-                reply_markup=inline_keyboard(v),
+                reply_markup=self._markup_with(v, extra_row),
             )
         )
 

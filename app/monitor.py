@@ -15,7 +15,11 @@ from .hirify import (
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
     HirifyNotFound, HirifyRestrictedError,
 )
-from .parsing import CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, parse_job_page, vacancy_from_api, vacancy_from_feed_item
+from .parsing import (
+    CRYPTO_RE, INDUSTRY_RE, NON_REMOTE_RE, dedup_hash,
+    parse_job_page, vacancy_from_api, vacancy_from_feed_item,
+)
+from .reports import maybe_scheduled
 from .sender import VacancySender
 from .textparse import looks_like_vacancy, parse_vacancy_text
 
@@ -270,6 +274,13 @@ class Monitor:
                     wait = self._post_poll_wait(stats)
                 except Exception:  # noqa: BLE001
                     log.exception("Цикл мониторинга упал с ошибкой")
+            # регулярные отчёты конвейера канала (вечерний дайджест — 21:00,
+            # недельная аналитика — воскресенье): проверка каждый проход,
+            # независимо от паузы мониторинга — посты уже в канале
+            try:
+                await maybe_scheduled(self.cfg, self.db, self.sender)
+            except Exception:  # noqa: BLE001
+                log.exception("Регулярные отчёты канала не отработали")
             await self._sleep(wait)
         log.info("Мониторинг остановлен")
 
@@ -289,7 +300,7 @@ class Monitor:
             "total": 0, "sent": 0, "skipped": 0, "filtered": 0, "failed": 0,
             "stale": 0, "fetch_failed": 0, "send_failed": 0, "no_audience": 0,
             "anon": 0, "button": 0, "cookie_warn": False, "automation_pause": False,
-            "quota_deferred": 0,
+            "quota_deferred": 0, "duplicates": 0,
         }
 
     @staticmethod
@@ -723,7 +734,24 @@ class Monitor:
 
     async def _deliver_vacancy(self, job_id: int, v, recipients: list[dict], stats: dict) -> None:
         """Доставка карточки по адресатам + финализация статуса
-        (общее для вакансий hirify и постов ТГ-каналов)."""
+        (общее для вакансий hirify и постов ТГ-каналов).
+
+        ПЕРЕД доставкой — дедуп по СОДЕРЖИМОМУ: HR раскидывает один пост по
+        нескольким каналам, копии приходят с разными id и дедупом по id не
+        ловятся. Отпечаток — нормализованные заголовок+компания (нет её —
+        заголовок+контакт). Копия уже доставленной вакансии помечается
+        skipped_duplicate: до подписчиков и в очередь канала не идёт.
+        """
+        h = dedup_hash(v)
+        if h:
+            self.db.set_dedup_hash(job_id, h)
+            dup = self.db.duplicate_of(h, job_id)
+            if dup:
+                self.db.mark_job(job_id, "skipped_duplicate")
+                stats["duplicates"] += 1
+                log.info("job %d — дубль вакансии %d (дедуп по содержимому), пропускаю",
+                         job_id, dup)
+                return
         delivered = 0
         for s in recipients:
             try:
