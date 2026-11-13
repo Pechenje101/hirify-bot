@@ -280,3 +280,62 @@ def test_legacy_db_without_subscriber_settings_is_migrated():
         assert s["username"] == "@legacy" and s["feeds"] is None and s["silent"] is False
         assert s["display"] == "auto"  # колонка display добавлена с дефолтом
         db.close()
+
+
+def test_prune_jobs():
+    """Гигиена БД: старьё (включая зависшие ретраи) удаляется, свежее остаётся."""
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        # свежие вакансии
+        for i in (1, 2, 3):
+            db.add_job(i, f"slug-{i}", f"https://hirify.me/jobs/{i}-slug-{i}")
+            db.mark_job(i, "sent")
+        # старьё: first_seen задвинут в прошлое (sent и зависший send_failed)
+        for i in (4, 5):
+            db.add_job(i, f"slug-{i}", f"https://hirify.me/jobs/{i}-slug-{i}")
+        db.mark_job(4, "sent")
+        db.mark_job(5, "send_failed")  # зависший ретрай — тоже мусор в этом возрасте
+        with db.conn:  # прямой доступ в тесте: задвинуть время появления
+            db.conn.execute("UPDATE jobs SET first_seen='2020-01-01T00:00:00+00:00' WHERE job_id IN (4,5)")
+
+        removed = db.prune_jobs(35)
+        assert removed == 2
+        assert db.job_status(4) is None and db.job_status(5) is None
+        assert db.job_status(1) == "sent"  # свежие не тронуты
+        assert db.known_job_ids([1, 2, 3]) == {1, 2, 3}  # дедуп жив
+
+        # повторная чистка в тот же день — удалять больше нечего
+        assert db.prune_jobs(35) == 0
+
+        # файл пережил VACUUM и не побился
+        assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+        # days=0 — чистка выключена: даже явный мусор не трогаем
+        db.add_job(6, "slug-6", "https://hirify.me/jobs/6-slug-6")
+        with db.conn:
+            db.conn.execute("UPDATE jobs SET first_seen='2020-01-01T00:00:00+00:00' WHERE job_id=6")
+        assert db.prune_jobs(0) == 0
+        assert db.job_status(6) is not None
+        db.close()
+
+
+def test_prune_reclaims_file_space():
+    """VACUUM в WAL кладёт сжатую копию в -wal: без wal_checkpoint(TRUNCATE)
+    основной .db не уменьшается (774 КБ на диске при 6 страницах контента) —
+    а именно его бот коммитит в git. Чистка обязана возвращать место файлу.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "t.db"
+        db = Database(p)
+        for i in range(1500):
+            db.add_job(i, f"slug-{i}", f"https://hirify.me/jobs/{i}-slug-{i}", title="T" * 300)
+        with db.conn:
+            db.conn.execute("UPDATE jobs SET first_seen='2020-01-01T00:00:00+00:00'")
+        before = p.stat().st_size
+        removed = db.prune_jobs(35)
+        assert removed == 1500
+        after = p.stat().st_size
+        assert after < before / 2          # место вернулось ОСНОВНОМУ файлу
+        assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        db.close()

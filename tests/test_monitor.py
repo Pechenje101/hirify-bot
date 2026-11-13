@@ -1358,7 +1358,9 @@ def test_button_mode_fallback_card_from_feed_item_when_landing_fails():
         "id": 105, "slug": "105-media-buyer-cpa",
         "title": "Media Buyer CPA", "company_title": "Acq Ltd",
         "tldr": "Кратко о вакансии", "work_format": ["remote"], "remote_type": "global",
-        "created_at": "2026-11-12T05:00:00.000000Z", "source": "telegram",
+        # ДИНАМИЧЕСКАЯ дата: фикс-таймстамп «стареет» вместе с календарём
+        # и вакансия выпадает из окна свежести — тест ломался через сутки
+        "created_at": datetime.now(timezone.utc).isoformat(), "source": "telegram",
         "is_scam": False, "is_potential_scam": False,
         "main_stack": [{"id": 1, "name": "media buying"}],
     }]
@@ -1369,4 +1371,35 @@ def test_button_mode_fallback_card_from_feed_item_when_landing_fails():
     assert v.title == "Media Buyer CPA" and v.company == "Acq Ltd"
     assert v.contacts_by_button is True
     assert "Кратко" in v.description
+    db.close()
+
+
+def test_db_prune_runs_once_per_day_in_poll():
+    """Гигиена БД в цикле: старьё удаляется на первом проходе дня, метка
+    ставится ДО работы (раны замещают друг друга — повторов не будет),
+    второй проход в тот же день уже не чистит."""
+    mon, client, sender, db = make_monitor()
+    mon.cfg.db_prune_days = 35
+    db.add_job(999, "999-dead", "https://hirify.me/jobs/999-dead")
+    db.mark_job(999, "send_failed")  # зависший ретрай древней вакансии
+    with db.conn:
+        db.conn.execute("UPDATE jobs SET first_seen='2020-01-01T00:00:00+00:00' WHERE job_id=999")
+
+    assert mon._db_prune_due() is True          # сегодня ещё не чистили
+    stats = asyncio.run(mon.poll_once(source="test"))
+    assert stats["total"] >= 1                  # проход жив, чистка его не сломала
+    assert db.job_status(999) is None            # старьё удалено прямо в проходе
+    assert mon._db_prune_due() is False         # метка дня поставлена
+    db.close()
+
+
+def test_db_prune_disabled():
+    """DB_PRUNE_DAYS=0 — чистки нет вовсе, данные не трогаем."""
+    mon, _, _, db = make_monitor()
+    mon.cfg.db_prune_days = 0
+    db.add_job(999, "999-dead", "https://hirify.me/jobs/999-dead")
+    with db.conn:
+        db.conn.execute("UPDATE jobs SET first_seen='2020-01-01T00:00:00+00:00' WHERE job_id=999")
+    asyncio.run(mon.poll_once(source="test"))
+    assert db.job_status(999) is not None       # выключено — ничего не удалено
     db.close()

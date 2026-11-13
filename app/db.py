@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -216,6 +216,38 @@ class Database:
                 (status, status, _now(), job_id),
             )
             self.conn.commit()
+
+    def prune_jobs(self, days: float, vacuum: bool = True) -> int:
+        """Гигиена БД: удалить вакансии со first_seen старше days дней.
+
+        Дедуп нужен только по свежим публикациям — фид отдаёт одни лишь
+        последние страницы, вакансия недельной давимости в него уже не
+        вернётся, поэтому старьё (включая зависшие ретраи send_failed/new)
+        можно удалять безболезненно. Иначе таблица растёт вечно (~180 строк
+        в сутки) и раздувает каждый коммит БД в git.
+
+        vacuum=True — после удаления вернуть место файлу (VACUUM): коммит
+        в репозиторий остаётся лёгким. Возвращает число удалённых строк.
+        days<=0 — чистка выключена (0 удалений).
+        """
+        if days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+        with _LOCK:
+            cur = self.conn.execute("DELETE FROM jobs WHERE first_seen < ?", (cutoff,))
+            removed = max(cur.rowcount or 0, 0)
+            self.conn.commit()
+            if removed and vacuum:
+                try:
+                    # В WAL-режиме VACUUM кладёт сжатую копию в -wal: без
+                    # чекпоинта основной .db файл НЕ уменьшается (проверено:
+                    # 774 КБ на диске при 6 страницах контента) — а именно
+                    # его бот коммитит в git. Не в транзакции: после commit().
+                    self.conn.execute("VACUUM")
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:  # noqa: BLE001 — место вернём в следующий раз
+                    pass
+        return removed
 
     def stats(self) -> dict:
         with _LOCK:

@@ -237,6 +237,10 @@ class Config:
     # не мгновенно. Ровные 1.5 с между открытиями вакансий — метроном,
     # каким джоб-борды люди не листают.
     fetch_delay_sec: float = field(default_factory=lambda: _get_float("FETCH_DELAY_SEC", 1.5))
+    # Гигиена БД: вакансии старше N дней удаляются раз в сутки (VACUUM
+    # возвращает место файлу) — дедупу нужно только свежёе, а файл БД
+    # коммитится в git и не должен пухнуть. 0 — чистка выключена.
+    db_prune_days: float = field(default_factory=lambda: _get_float("DB_PRUNE_DAYS", 35.0))
     vacancy_gap_sec: str = field(default_factory=lambda: os.getenv("VACANCY_GAP_SEC", "6,14"))
     contacts_gap_sec: str = field(default_factory=lambda: os.getenv("CONTACTS_GAP_SEC", "4,9"))
     request_timeout_sec: float = field(default_factory=lambda: _get_float("REQUEST_TIMEOUT_SEC", 30.0))

@@ -214,6 +214,28 @@ class Monitor:
             return False
         return self.db.get_setting("deep_sweep_date", "") != self._today_msk()
 
+    def _db_prune_due(self) -> bool:
+        """Гигиена БД раз в сутки: вакансии старше DB_PRUNE_DAYS дней не
+        нужны дедупу (фид отдаёт только свежие страницы), файл БД коммитится
+        в git и не должен расти вечно. Проверка чистая (метка ставится
+        ПОСЛЕ чистки, как у «метлы»): оборванный на середине ран повторит
+        чистку следующим проходом — DELETE идемпотентен, дублей не будет.
+        """
+        if self.cfg.db_prune_days <= 0:
+            return False
+        return self.db.get_setting("db_prune_date", "") != self._today_msk()
+
+    def _db_prune(self) -> None:
+        """Одна чистка: старьё прочь + VACUUM; метка дня ставится после.
+        Отдельный метод — для тестов."""
+        removed = self.db.prune_jobs(self.cfg.db_prune_days)
+        self.db.set_setting("db_prune_date", self._today_msk())
+        if removed:
+            log.info("Гигиена БД: удалено %d вакансий старше %.0f дн. (VACUUM вернул место файлу)",
+                     removed, self.cfg.db_prune_days)
+        else:
+            log.debug("Гигиена БД: удалять нечего (все вакансии свежее %.0f дн.)", self.cfg.db_prune_days)
+
     async def _sleep(self, seconds: float) -> None:
         """Сон, который можно прервать: /resume, /start (nudge) или stop()."""
         try:
@@ -314,6 +336,13 @@ class Monitor:
 
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
         stats = self._new_stats()
+
+        # 0.5) гигиена БД — раз в сутки, ПЕРЕД основным разбором: старьё
+        #      прочь + VACUUM сжимает файл ДО того, как этот ран закоммитит
+        #      БД в git. Дедупу достаточно свежего окна, а раны замещают
+        #      друг друга — маркер даты живёт в БД (см. _db_prune_due).
+        if self._db_prune_due():
+            self._db_prune()
 
         # 0) «метла» — глубокий первый проход (catchup_feed_pages), чтобы хвост
         # бэклога не ушёл со страницы 1 навсегда. Два повода, один раз в сутки:
