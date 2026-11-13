@@ -28,6 +28,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Запуск и подписка на вакансии"),
     BotCommand(command="fresh", description="Проверить вакансии сейчас"),
     BotCommand(command="digest", description="Дайджест последних вакансий"),
+    BotCommand(command="pending", description="Очередь модерации канала"),
     BotCommand(command="settings", description="Разделы, вид карточек, тихий режим"),
     BotCommand(command="test", description="Демо-карточка вакансии"),
     BotCommand(command="stats", description="Статистика"),

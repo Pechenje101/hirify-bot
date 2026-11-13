@@ -21,6 +21,7 @@ from .digest import (
     render_digest, selection_keyboard, selection_text, sessions, suggest,
 )
 from .hirify import HirifyAutomationError, HirifyRestrictedError
+from .moderation import moderation_target, panel_keyboard, panel_text, publish_job
 from .monitor import POLL_JITTER
 from .parsing import _api_contacts
 from .services import Services
@@ -658,6 +659,177 @@ async def on_digest_cancel(cb: CallbackQuery, services: Services):
         except Exception:  # noqa: BLE001
             pass
     await cb.answer()
+
+
+# ------------------------------------------------- модерация канала
+# Канал владельца: каждая карточка уходит в личку вместе с панелью
+# «✅ Опубликовать / ❌ Отклонить»; очередь живёт в БД (payload+mod_status),
+# так что раны Actions самозамещаются между доставкой и нажатием.
+
+
+@router.callback_query(F.data.startswith("mod:"))
+async def on_moderation_button(cb: CallbackQuery, services: Services):
+    """Кнопки панели модерации: решение владельца по вакансии."""
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    action, jid = parts[1], parts[2]
+    try:
+        job_id = int(jid)
+    except ValueError:
+        await cb.answer()
+        return
+    # решение принимает только владелец бота (панель приходит ему одному,
+    # но и чужую кнопку гардим)
+    if (services.cfg.admin_chat_id and cb.from_user
+            and cb.from_user.id != services.cfg.admin_chat_id):
+        await cb.answer("Модерация — только для владельца бота", show_alert=True)
+        return
+    if action == "ok":
+        out = await publish_job(job_id, services)
+        if out in ("ok", "already"):
+            job = services.db.get_job(job_id) or {}
+            title = html_mod.escape(str(job.get("title") or "вакансия"))
+            note = "✅ Опубликовано в канал" if out == "ok" else "☑️ Уже опубликована"
+            await _mod_done(cb, f"{note}\n<b>{title}</b>", services)
+            await cb.answer("✅ Опубликовано" if out == "ok" else "Уже опубликована")
+        elif out == "nochan":
+            await cb.answer("Канал не задан: /setchannel <@имя или -100…>", show_alert=True)
+        elif out == "noid":
+            await cb.answer("Вакансия уже не найдена в базе", show_alert=True)
+        elif out == "nopayload":
+            await cb.answer("Данные карточки не сохранились — пропустите вакансию", show_alert=True)
+        else:
+            await cb.answer("Не получилось отправить (бот — админ канала?) — попробуйте позже", show_alert=True)
+        return
+    if action == "no":
+        services.db.set_mod(job_id, "no")
+        job = services.db.get_job(job_id) or {}
+        title = html_mod.escape(str(job.get("title") or "вакансия"))
+        await _mod_done(cb, f"❌ Отклонено\n<b>{title}</b>", services)
+        await cb.answer("❌ Отклонено")
+        return
+    await cb.answer()
+
+
+async def _mod_done(cb: CallbackQuery, text: str, services: Services) -> None:
+    """Закрыть панель: убрать кнопки, оставить вердикт (сообщение могли удалить — не беда)."""
+    if cb.message is None:
+        return
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@router.message(Command("pending"))
+async def cmd_pending(message: Message, services: Services):
+    """Очередь модерации заново: панели со свежими кнопками."""
+    if not await _ensure_private(message):
+        return
+    if not await _is_admin_guard(message, services):
+        return
+    rows = services.db.pending_moderation(8)
+    st = services.db.moderation_stats()
+    header = (
+        f"🎛 <b>Модерация канала</b>\n"
+        f"В очереди: <b>{st['queue']}</b> · опубликовано {st['posted']}"
+        f" · отклонено {st['rejected']}\n\n"
+    )
+    if not rows:
+        extra = "" if moderation_target(services.cfg, services.db) else (
+            "\n⚠️ Канал не задан: сначала /setchannel <@имя> — бот должен быть "
+            "админом канала с правом постить."
+        )
+        await message.answer(header + "Очередь пуста — все решения приняты." + extra,
+                             parse_mode="HTML")
+        return
+    await message.answer(header, parse_mode="HTML")
+    for r in rows:
+        await services.sender.send_text(
+            message.chat.id,
+            panel_text(str(r.get("title") or ""), str(r.get("company") or ""),
+                       str(r.get("salary") or "")),
+            markup=panel_keyboard(int(r["job_id"])),
+        )
+
+
+async def _is_admin_guard(message: Message, services: Services) -> bool:
+    """Личка И владелец (как /pause: без ADMIN_CHAT_ID — личный бот, пускаем)."""
+    if not _is_admin(services.cfg, message):
+        try:
+            await message.answer("🔒 Команда доступна только администратору бота.")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    return True
+
+
+@router.message(Command("setchannel"))
+async def cmd_setchannel(message: Message, command: CommandObject, services: Services):
+    """Задать/показать канал публикаций (только владелец).
+
+    /setchannel <@имя | -100…> — включить: карточки пойдут с панелями
+    модерации, «✅ Опубликовать» постит в канал. Бот должен быть админом
+    канала с правом отправки сообщений.
+    /setchannel off — выключить модерацию (очередь сохранится).
+    """
+    if not await _ensure_admin(message, services):
+        return
+    raw = (command.args or "").strip()
+    if not raw:
+        cur = moderation_target(services.cfg, services.db)
+        if cur:
+            await message.answer(
+                f"📡 Канал публикаций: <code>{cur}</code>\n"
+                "Модерация включена — новые карточки идут с панелями.\n"
+                "Сменить: /setchannel &lt;@имя&gt; · выключить: /setchannel off",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "📡 Канал публикаций не задан.\n\n"
+                "1) Добавьте бота админом в канал с правом отправки сообщений\n"
+                "2) /setchannel &lt;@имя канала или -100…&gt;\n\n"
+                "После этого каждая карточка будет приходить с кнопками"
+                " «✅ Опубликовать» / «❌ Отклонить», а решённые — поститься"
+                " в канал нативно, без «Переслано от…».",
+                parse_mode="HTML",
+            )
+        return
+    if raw.lower() in ("off", "none", "0"):
+        services.db.set_setting("post_channel_id", "")
+        await message.answer("⏸ Канал публикаций отключён — модерация выключена.\n"
+                             "Очередь сохранена: /pending покажет после включения.")
+        return
+    if raw.lstrip("-").isdigit():
+        chat_id = int(raw)
+    elif raw.startswith("@") and len(raw) > 1:
+        try:
+            chat = await message.bot.get_chat(raw)
+            chat_id = chat.id
+        except Exception as e:  # noqa: BLE001 — имя не резолвится
+            await message.answer(
+                f"❌ Не нашёл канал {html_mod.escape(raw)}: {e}\n\n"
+                "Проверьте имя (и что бот уже добавлен админом) или пришлите"
+                " числовой id вида -1001234567890.", parse_mode="HTML")
+            return
+    else:
+        await message.answer(
+            "❌ Не понял аргумент. Примеры:\n"
+            "<code>/setchannel @my_vacancy_channel</code>\n"
+            "<code>/setchannel -1001234567890</code>\n"
+            "<code>/setchannel off</code>", parse_mode="HTML")
+        return
+    services.db.set_setting("post_channel_id", str(chat_id))
+    await message.answer(
+        f"✅ Канал публикаций: <code>{chat_id}</code>\n\n"
+        "Теперь каждая новая карточка придёт с кнопками «✅ Опубликовать» /"
+        " «❌ Отклонить». Пост в канале — нативный, без «Переслано от…».\n"
+        "Очередь решений: /pending · выключить: /setchannel off",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("pause"))

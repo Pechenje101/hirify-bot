@@ -302,6 +302,11 @@ class Config:
     # этого любой пользователь, нашедший бота, сможет подменить cookie или
     # остановить мониторинг для всех. 0 = гарда нет (личный бот).
     admin_chat_id: int = field(default_factory=lambda: _get_int("ADMIN_CHAT_ID", 0))
+    # Канал публикаций владельца (модерация «по кнопке»): сюда «✅ Post»
+    # отправляет карточку нативным постом. Бот должен быть админом канала.
+    # Задаётся и через окружение, и командой /setchannel (хранится в БД,
+    # перекрывает окружение). 0 = модерация выключена (обычная рассылка).
+    post_channel_id: int = field(default_factory=lambda: _get_int("POST_CHANNEL_ID", 0))
     db_path: Path = field(default_factory=lambda: BASE_DIR / os.getenv("DB_PATH", "data/hirify_bot.db"))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     debug_dump_dir: Path = field(default_factory=lambda: BASE_DIR / "debug")

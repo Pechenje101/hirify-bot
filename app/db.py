@@ -94,6 +94,16 @@ class Database:
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
             if "attempts" not in cols:
                 self.conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            # миграция старых баз: модерация публикаций (канал владельца):
+            # mod_status — '' (обычная рассылка) | 'queue' | 'posted' | 'no';
+            # payload — ПОЛНЫЙ JSON Vacancy при постановке в очередь: описание,
+            # стек и контакты нужны для повторного рендера карточки в момент
+            # нажатия «Опубликовать» (раны Actions самозамещаются — панель и
+            # нажатие живут в разных ранах, между ними был рестарт)
+            if "mod_status" not in cols:
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN mod_status TEXT NOT NULL DEFAULT ''")
+            if "payload" not in cols:
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
             # миграция старых баз: настройки подписчика (feeds, silent, display)
             scols = {r[1] for r in self.conn.execute("PRAGMA table_info(subscribers)")}
             if "feeds" not in scols:
@@ -155,11 +165,12 @@ class Database:
 
     def get_job(self, job_id: int) -> dict | None:
         """Вся строка вакансии (slug/url/title/tg_contacts/…) — для кнопки
-        «Показать контакты»: контакт материализуется в tg_contacts и кэшируется."""
+        «Показать контакты» и модерации публикаций (mod_status + payload)."""
         with _LOCK:
             row = self.conn.execute(
                 "SELECT job_id, slug, url, title, company, salary, tg_contacts,"
-                " attempts, first_seen, sent_at, status FROM jobs WHERE job_id=?",
+                " attempts, first_seen, sent_at, status, mod_status, payload"
+                " FROM jobs WHERE job_id=?",
                 (job_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -281,6 +292,48 @@ class Database:
                 except sqlite3.Error:  # noqa: BLE001 — место вернём в следующий раз
                     pass
         return removed
+
+    # ---------- модерация публикаций ----------
+
+    def save_moderation(self, job_id: int, payload: str, mod_status: str = "queue") -> None:
+        """Поставить вакансию в очередь модерации: полный payload карточки
+        и статус одним UPDATE (атомарно)."""
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET payload=?, mod_status=? WHERE job_id=?",
+                (payload, mod_status, job_id),
+            )
+            self.conn.commit()
+
+    def set_mod(self, job_id: int, mod_status: str) -> None:
+        """Сменить решение модерации: 'posted' | 'no' (снять с очереди)."""
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET mod_status=? WHERE job_id=?", (mod_status, job_id)
+            )
+            self.conn.commit()
+
+    def pending_moderation(self, limit: int = 10) -> list[dict]:
+        """Очередь модерации (старые сверху — FIFO, как пришли)."""
+        with _LOCK:
+            rows = self.conn.execute(
+                "SELECT job_id, title, company, salary, first_seen, mod_status"
+                " FROM jobs WHERE mod_status='queue'"
+                " ORDER BY first_seen ASC, job_id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def moderation_stats(self) -> dict:
+        """Счётчики решений модерации — для шапки /pending."""
+        with _LOCK:
+            rows = self.conn.execute(
+                "SELECT mod_status, COUNT(*) AS n FROM jobs"
+                " WHERE mod_status != '' GROUP BY mod_status"
+            ).fetchall()
+        d = {r["mod_status"]: r["n"] for r in rows}
+        return {"queue": d.get("queue", 0), "posted": d.get("posted", 0),
+                "rejected": d.get("no", 0)}
 
     def stats(self) -> dict:
         with _LOCK:

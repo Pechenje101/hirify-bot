@@ -570,6 +570,72 @@ SALARY_UNITS = {
 }
 
 
+# --------------------------------------------------------------- сериализация
+
+def vacancy_to_payload(v: Vacancy) -> str:
+    """Полный JSON Vacancy — для очереди модерации публикаций.
+
+    Рендер карточки в канал происходит ПОСЛЕ решения владельца (кнопка), а
+    раны Actions самозамещаются: между доставкой и нажатием был рестарт,
+    поэтому полное состояние карточки (описание, стек, контакты, даты)
+    обязано жить в БД, а не в памяти.
+    """
+    d = {
+        "job_id": v.job_id, "slug": v.slug, "url": v.url,
+        "title": v.title, "company": v.company, "salary": v.salary,
+        "work_format": v.work_format, "employment_type": v.employment_type,
+        "grade": v.grade, "location": v.location, "skills": list(v.skills or []),
+        "description": v.description, "date_posted": v.date_posted,
+        "source_type": v.source_type, "contacts_hidden": v.contacts_hidden,
+        "feed_key": v.feed_key, "feed_label": v.feed_label,
+        "contacts_by_button": v.contacts_by_button,
+        "contacts": [
+            {"kind": c.kind, "value": c.value, "display": c.display,
+             "url": c.url, "source": c.source} for c in v.contacts
+        ],
+    }
+    return json.dumps(d, ensure_ascii=False)
+
+
+def vacancy_from_payload(raw: str | None) -> Optional[Vacancy]:
+    """Обратное к vacancy_to_payload; мусор/пусто → None (не поднимаем)."""
+    try:
+        d = json.loads(raw or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(d, dict) or not d.get("job_id"):
+        return None  # пусто/битое — карточки нет
+    contacts = []
+    for c in d.get("contacts") or []:
+        if isinstance(c, dict):
+            contacts.append(TGContact(
+                kind=str(c.get("kind") or ""), value=str(c.get("value") or ""),
+                display=str(c.get("display") or ""), url=str(c.get("url") or ""),
+                source=str(c.get("source") or "page"),
+            ))
+    raw_skills = d.get("skills")
+    skills = [str(s) for s in raw_skills] if isinstance(raw_skills, list) else []
+    try:
+        return Vacancy(
+            job_id=int(d.get("job_id") or 0), slug=str(d.get("slug") or ""),
+            url=str(d.get("url") or ""), title=str(d.get("title") or ""),
+            company=str(d.get("company") or ""), salary=str(d.get("salary") or ""),
+            work_format=str(d.get("work_format") or ""),
+            employment_type=str(d.get("employment_type") or ""),
+            grade=str(d.get("grade") or ""), location=str(d.get("location") or ""),
+            skills=skills,
+            description=str(d.get("description") or ""),
+            date_posted=str(d.get("date_posted") or ""),
+            contacts=contacts, source_type=str(d.get("source_type") or ""),
+            contacts_hidden=bool(d.get("contacts_hidden")),
+            feed_key=str(d.get("feed_key") or ""),
+            feed_label=str(d.get("feed_label") or ""),
+            contacts_by_button=bool(d.get("contacts_by_button")),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _salary_from_api(s) -> str:
     """Зарплата из JSON-API: словарь {min/max/from/to, currency, period/…}."""
     if not isinstance(s, dict):

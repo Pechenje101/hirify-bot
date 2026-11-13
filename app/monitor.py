@@ -10,6 +10,7 @@ from typing import Optional
 
 from .db import Database
 from .channels import ChannelClient, channel_job_id
+from .moderation import moderation_active, queue_for_moderation
 from .hirify import (
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
     HirifyNotFound, HirifyRestrictedError,
@@ -737,6 +738,15 @@ class Monitor:
         if delivered:
             self.db.mark_job(job_id, "sent")
             stats["sent"] += 1
+            # канал владельца включён → карточка уходит и в очередь модерации
+            # (панель с кнопками — под карточкой, в чат админа; состояние в БД)
+            if moderation_active(self.cfg, self.db):
+                admin_got = any(
+                    s["chat_id"] == self.cfg.admin_chat_id for s in recipients
+                )
+                await queue_for_moderation(
+                    job_id, v, self.cfg, self.db, self.sender, admin_got,
+                )
         else:
             attempts = self.db.bump_job_attempts(job_id)
             if attempts >= MAX_SEND_ATTEMPTS:
