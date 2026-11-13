@@ -980,7 +980,7 @@ class Monitor:
             # админа и оставим вакансию на ретрай (когда cookie оживёт)
             log.error("Сессия hirify.me не принимается (%s) — обновите cookie", e)
             stats["cookie_warn"] = True
-            self._warn_cookie([s["chat_id"] for s in subscribers[:1]])
+            self._warn_cookie(self._ops_recipients(subscribers))
             self.db.mark_job(job_id, "fetch_failed")
             stats["fetch_failed"] += 1
             return "continue"
@@ -1017,7 +1017,7 @@ class Monitor:
         self.db.set_setting("automation_last_flag", str(int(self._automation_last_flag)))
         log.warning("Сайт заподозрил автоматизацию (срабатывание №%d) — пауза %d мин: %s",
                     count, minutes, e)
-        self._warn_automation([s["chat_id"] for s in subscribers[:1]], minutes)
+        self._warn_automation(self._ops_recipients(subscribers), minutes)
         return minutes
 
     def _automation_healed(self, subscribers: list[dict], announce: bool = False) -> None:
@@ -1049,8 +1049,21 @@ class Monitor:
             from . import texts
 
             self._fire_and_forget_text(
-                [s["chat_id"] for s in subscribers[:1]], texts.AUTOMATION_LIFTED,
+                self._ops_recipients(subscribers), texts.AUTOMATION_LIFTED,
             )
+
+    def _ops_recipients(self, subscribers: list[dict]) -> list[int]:
+        """Адресаты СЛУЖЕБНЫХ предупреждений (cookie умер / флаг автоматизации /
+        «флаг снят»): владелец бота, если задан; иначе первый подписчик
+        (режим личного бота без ADMIN_CHAT_ID).
+
+        Раньше уходило подписчику №1 из таблицы — то есть случайному человеку,
+        который не может исполнить инструкцию «/setcookie»: утечка служебных
+        сообщений и путаница у пользователей.
+        """
+        if self.cfg.admin_chat_id:
+            return [self.cfg.admin_chat_id]
+        return [s["chat_id"] for s in subscribers[:1]]
 
     def _warn_cookie(self, recipients: list[int]) -> None:
         """Одно напоминание в 6 часов, если контакты выглядят скрытыми."""

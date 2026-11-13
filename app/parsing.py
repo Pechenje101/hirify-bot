@@ -780,7 +780,12 @@ def vacancy_from_feed_item(item: dict, url: str, feed=None) -> Vacancy:
         v.location = ", ".join(x for x in (r.get("name") for r in regions if isinstance(r, dict)) if x)
     v.salary = _salary_from_api(item.get("salary"))
     stack: list[str] = []
-    for t in (item.get("main_stack") or item.get("tags") or []):
+    # main_stack бывает строкой (а не списком) — раньше итерация по ней
+    # давала «скиллы»-одиночные буквы; теперь строка = один навык
+    raw_stack = item.get("main_stack")
+    if isinstance(raw_stack, str):
+        raw_stack = [raw_stack] if raw_stack.strip() else None
+    for t in (raw_stack or item.get("tags") or []):
         if isinstance(t, dict):
             name = t.get("name")
             if name:

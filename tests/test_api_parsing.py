@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.parsing import (  # noqa: E402
     TGContact, _api_contacts, _salary_from_api, vacancy_from_api,
+    vacancy_from_feed_item,
 )
 
 # Реальный ответ GET /api/vacancies/1342174-telegram-outreach-manager-igaming
@@ -129,3 +130,30 @@ def test_numeric_and_raw_contact_values():
     kinds = sorted(c.kind for c in got)
     assert kinds == ["user_id", "username"]
     assert all(isinstance(c, TGContact) for c in got)
+
+
+def test_feed_item_string_main_stack_is_one_skill():
+    """Регресс: main_stack строкой (бывает в ответах API) — это ОДИН навык.
+
+    Раньше цикл for по строке давал «скиллы»-одиночные буквы
+    (['P', 'y', 't', 'h', 'o', 'n']) и панель навыков карточки превращалась
+    в мусор; пустая строка должна проваливаться на tags, как и отсутствие."""
+    base = {
+        "id": 202, "slug": "202-media-buyer", "title": "Media Buyer",
+        "company_title": "CPA People", "tldr": "Высокорисковые гео, арбитраж.",
+        "created_at": "2026-11-13T08:00:00+00:00",
+    }
+    # строка — один навык, не посимвольный мусор
+    v = vacancy_from_feed_item(dict(base, main_stack="Python"),
+                               "https://hirify.me/jobs/202-media-buyer")
+    assert v.skills == ["Python"]
+    # пустая строка — как отсутствие: берём tags
+    v2 = vacancy_from_feed_item(
+        dict(base, id=203, main_stack="", tags=[{"id": 1, "name": "facebook ads"}]),
+        "https://hirify.me/jobs/203-media-buyer")
+    assert v2.skills == ["facebook ads"]
+    # обычный список — прежнее поведение
+    v3 = vacancy_from_feed_item(
+        dict(base, id=204, main_stack=["google ads", "terraform"]),
+        "https://hirify.me/jobs/204-media-buyer")
+    assert v3.skills == ["google ads", "terraform"]

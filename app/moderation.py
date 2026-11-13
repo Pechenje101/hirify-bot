@@ -6,8 +6,9 @@
    самозамещение ранов Actions), а админу приходит компактная панель с
    кнопками «✅ Опубликовать» / «❌ Отклонить»;
 2) «Опубликовать» — карточка отправляется в канал нативным постом тем же
-   конвейером (sender.send_vacancy, вид как в /settings владельца, с
-   автооткатом bubble→rich→классика). Карточка ЧИСТАЯ — как в рассылке:
+   конвейером (sender.send_vacancy), ВСЕГДА КЛАССИКОЙ (текст): такой пост
+   потом правит «🔒 Закрыть» через editMessageText, который rich/виджеты
+   редактировать не умеет. Карточка ЧИСТАЯ — как в рассылке:
    без футера-источника и хештегов, единственная кнопка — «Написать
    рекрутеру» (воронки «Откликнуться» в личку бота больше нет — решение
    владельца 13.11). Запоминаются id поста и время (posted_at, chan_msg_id);
@@ -31,7 +32,6 @@ import logging
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .cards import render_classic_html
-from .db import DEFAULT_DISPLAY
 from .parsing import vacancy_from_payload, vacancy_to_payload
 
 # Services НЕ импортируем на уровне модуля: services.py тянет monitor.py,
@@ -164,11 +164,14 @@ async def publish_job(job_id: int, services) -> str:
     v = vacancy_from_payload(job.get("payload") or "")
     if v is None:
         return "nopayload"
-    sub = db.subscriber(cfg.admin_chat_id) if cfg.admin_chat_id else None
-    display = sub["display"] if sub else DEFAULT_DISPLAY
+    # Пост в канал — всегда КЛАССИКА (текст): «🔒 Закрыть» правит его потом
+    # editMessageText, а тот умеет только текстовые посты — rich-сообщение
+    # или виджет отредактировать нельзя (виджеты в каналы и вовсе не уходят).
+    # Читателям канала классика гарантированно видна в любом клиенте.
+    # Вид из /settings владельца остаётся его личным выбором рассылки.
     try:
         _mode, msg_id = await services.sender.send_vacancy(
-            target, v, display=display, want_message=True,
+            target, v, display="classic", want_message=True,
         )
     except Exception as e:  # noqa: BLE001 — бот не админ / флад / сеть
         log.warning("Публикация job %s в канал %s не прошла: %s", job_id, target, e)

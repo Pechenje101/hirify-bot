@@ -477,7 +477,9 @@ async def fetch_contacts_for_job(job_id: int, services: Services) -> tuple[str, 
     if not contacts:
         return "empty", []
     entries = [{"kind": c.kind, "value": c.value, "display": c.display} for c in contacts]
-    db.update_job_parsed(job_id, tg_contacts=entries)
+    # только контакты: update_job_parsed с пустыми дефолтами стирал бы
+    # title/company/salary — дайджесты и панели показывали бы «вакансия №…»
+    db.set_job_contacts(job_id, entries)
     mon.automation_recovered()
     return "ok", entries
 

@@ -281,6 +281,20 @@ class Database:
             )
             self.conn.commit()
 
+    def set_job_contacts(self, job_id: int, tg_contacts: list[dict] | None) -> None:
+        """Запомнить материализованные контакты кнопкой «Показать контакты».
+
+        Пишет ТОЛЬКО tg_contacts: title/company/salary уже лежат в строке
+        (update_job_parsed с дефолтами стирал бы их пустыми строками —
+        дайджесты и панели модерации теряли бы название вакансии).
+        """
+        with _LOCK:
+            self.conn.execute(
+                "UPDATE jobs SET tg_contacts=? WHERE job_id=?",
+                (json.dumps(tg_contacts or [], ensure_ascii=False), job_id),
+            )
+            self.conn.commit()
+
     def mark_job(self, job_id: int, status: str) -> None:
         with _LOCK:
             self.conn.execute(
@@ -422,7 +436,8 @@ class Database:
         with _LOCK:
             row = self.conn.execute(
                 """SELECT COUNT(*) AS n FROM jobs
-                   WHERE sent_at >= date('now', 'start of day')"""
+                   WHERE datetime(sent_at, '+3 hours')
+                       >= date('now', '+3 hours', 'start of day')"""
             ).fetchone()
             sent_today = row["n"]
         return {

@@ -87,6 +87,23 @@ def test_render_channel_digest_links_and_escaping():
     db.close()
 
 
+def test_render_channel_digest_shows_total_over_limit_overflow():
+    """Показываем максимум 10 позиций, но «Всего за день: N» честно говорит,
+    сколько вышло постов (раньше rows обрезался SQL LIMIT'ом и хвост
+    «Всего за день» никогда не рисовался)."""
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"), 12)
+    rows = db.posted_since("2000-01-01", 10)   # SQL уже обрезал до 10
+    total = db.posted_count_since("2000-01-01")
+    assert total == 12
+    html = render_channel_digest(rows, "https://t.me/x", msk(), total=total)
+    assert "Всего за день: 12" in html
+    assert html.count("<a href=") == 10       # в карточке — только первые 10
+    # без явного total — старое поведение (хвост не рисуем)
+    html2 = render_channel_digest(rows, "https://t.me/x", msk())
+    assert "Всего за день" not in html2
+    db.close()
+
+
 def test_channel_post_link_internal_format():
     # приватный канал: t.me/c/<внутренний id>/<msg>
     assert channel_post_link("https://t.me/c/1234", 7) == "https://t.me/c/1234/7"

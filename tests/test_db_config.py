@@ -339,3 +339,32 @@ def test_prune_reclaims_file_space():
         assert after < before / 2          # место вернулось ОСНОВНОМУ файлу
         assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         db.close()
+
+
+def test_stats_sent_today_counts_msk_day():
+    """/stats «Сегодня отправлено» — по МСК-дню, а не UTC (граница съезжает
+    на 3 часа). Отправка вчера 23:00 UTC == сегодня 02:00 МСК — «сегодня»;
+    вчера 20:30 UTC == вчера 23:30 МСК — «вчера»."""
+    from datetime import datetime, timedelta, timezone
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        now = datetime.now(timezone.utc)
+        msk_today = (now + timedelta(hours=3)).date()
+        yesterday = (msk_today - timedelta(days=1)).isoformat()
+        # (sent_at, должен ли считаться сегодняшним)
+        stamps = [
+            (f"{yesterday}T23:00:00+00:00", True),    # сегодня 02:00 МСК
+            (f"{yesterday}T20:30:00+00:00", False),    # вчера 23:30 МСК
+            (now.isoformat(timespec="seconds"), True), # прямо сейчас
+        ]
+        for i, (sent_at, _) in enumerate(stamps):
+            db.conn.execute(
+                "INSERT INTO jobs (job_id, slug, url, first_seen, sent_at, status)"
+                " VALUES (?, ?, ?, ?, ?, 'sent')",
+                (i, f"s{i}", f"u{i}", "2026-11-01T00:00:00+00:00", sent_at),
+            )
+        db.conn.commit()
+        expected = sum(1 for _, counted in stamps if counted)
+        assert db.stats()["sent_today"] == expected
+        db.close()

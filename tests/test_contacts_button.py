@@ -64,7 +64,8 @@ def make_services(contacts=CONTACTS_OK) -> tuple[Services, FakeClient, Monitor, 
     # вакансия «доставлена с кнопкой»: контактов в БД нет
     db.add_job(101, "senior-solidity-engineer",
                "https://hirify.me/jobs/101-senior-solidity-engineer",
-               title="Senior Solidity Engineer")
+               title="Senior Solidity Engineer",
+               company="Acme Labs", salary="4 500 – 6 500 USD")
     db.mark_job(101, "sent")
     return services, client, mon, db
 
@@ -90,6 +91,25 @@ def test_button_fetch_empty():
     out, entries = asyncio.run(fetch_contacts_for_job(101, services))
     assert out == "empty" and entries == []
     assert json.loads(db.get_job(101)["tg_contacts"]) == []
+    db.close()
+
+
+def test_button_fetch_preserves_title_company_salary():
+    """Регресс: контакты по кнопке НЕ стирают название/компанию/зарплату.
+
+    Раньше писали через update_job_parsed с пустыми дефолтами — карточка
+    оставалась с контактами, но в БД title/company/salary обнулялись:
+    /digest, панель /pending и вечерний дайджест канала показывали
+    «вакансия №…» без названия и зарплаты.
+    """
+    services, client, mon, db = make_services()
+    out, _ = asyncio.run(fetch_contacts_for_job(101, services))
+    assert out == "ok"
+    job = db.get_job(101)
+    assert job["title"] == "Senior Solidity Engineer"
+    assert job["company"] == "Acme Labs"
+    assert job["salary"] == "4 500 – 6 500 USD"
+    assert json.loads(job["tg_contacts"])[0]["value"] == "acme_hr"
     db.close()
 
 

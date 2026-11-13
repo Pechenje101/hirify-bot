@@ -387,6 +387,51 @@ def test_expired_session_warns_and_retries_later():
     db.close()
 
 
+def test_ops_recipients_prefers_admin_over_first_subscriber():
+    """Служебные предупреждения (cookie/флаг) адресуются ВЛАДЕЛЬЦУ бота.
+
+    Раньше адресатом был подписчик №1 из таблицы — то есть случайный человек,
+    который не может исполнить инструкцию «/setcookie»: утечка служебных
+    сообщений и путаница. Без ADMIN_CHAT_ID (личный бот) — прежнее поведение:
+    первый подписчик.
+    """
+    mon, _, _, db = make_monitor()
+    subs = [{"chat_id": 1}, {"chat_id": 2}]
+    mon.cfg.admin_chat_id = 5
+    assert mon._ops_recipients(subs) == [5]          # владелец, не чат 1
+    mon.cfg.admin_chat_id = 0
+    assert mon._ops_recipients(subs) == [1]           # личный бот — первый подписчик
+    assert mon._ops_recipients([]) == []              # некому — молчим
+    db.close()
+
+
+def test_cookie_warning_routed_to_admin_chat():
+    """Интеграция: 401 в проходе — подсказка про cookie уходит чату админа,
+    а не первому подписчику (chat 1 в этих тестах)."""
+    from app.hirify import HirifyAuthError
+
+    class AuthlessClient(FakeClient):
+        async def fetch_vacancy(self, slug):
+            raise HirifyAuthError("сессия не принята (HTTP 401)")
+
+    class SpySender(FakeSender):
+        def __init__(self):
+            super().__init__()
+            self.text_chats: list[int] = []
+
+        async def send_text(self, chat_id, html):
+            self.text_chats.append(chat_id)
+
+    mon, _, _, db = make_monitor()
+    spy = SpySender()
+    mon.sender = spy
+    mon.cfg.admin_chat_id = 5
+    mon.client = AuthlessClient(FEED_ITEMS, VACANCIES)
+    asyncio.run(mon.poll_once(source="test"))
+    assert spy.text_chats == [5]   # владельцу; подписчик №1 (чат 1) не получал
+    db.close()
+
+
 def test_scam_vacancies_are_skipped():
     """Помеченные сайтом как скам не рассылаем."""
     scam = vacancy_json("Miracle CTO Fund", 104)

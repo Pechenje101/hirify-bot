@@ -285,7 +285,10 @@ def test_publish_job_ok_and_full_card():
     db.close()
 
 
-def test_publish_job_display_follows_admin_settings():
+def test_publish_job_pins_classic_for_channel():
+    """Пост в канал — ВСЕГДА классика, даже если владелец выбрал себе
+    rich/пузырь: «🔒 Закрыть» потом правит пост editMessageText, а тот
+    умеет только текстовые сообщения (виджеты в каналы и не отправляются)."""
     db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
     sender = FakeSender()
     services = make_services(db=db, sender=sender)
@@ -294,7 +297,7 @@ def test_publish_job_display_follows_admin_settings():
     db.add_job(202, v.slug, v.url, title=v.title)
     db.save_moderation(202, vacancy_to_payload(v))
     asyncio.run(publish_job(202, services))
-    assert sender.displays == ["rich"]
+    assert sender.displays == ["classic"]
     db.close()
 
 

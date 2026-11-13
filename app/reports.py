@@ -47,19 +47,24 @@ def channel_post_link(link_base: str, msg_id: int) -> str:
     return f"{link_base.rstrip('/')}/{int(msg_id)}"
 
 
-def render_channel_digest(rows: list[dict], link_base: str, now_msk: datetime) -> str:
+def render_channel_digest(rows: list[dict], link_base: str, now_msk: datetime,
+                           total: int | None = None) -> str:
     """Карточка вечернего дайджеста канала: заголовок-ссылка на каждый пост.
 
-    rows — db.posted_since(): {job_id, title, company, salary, chan_msg_id}.
-    Порядок старые→новые (как читается канал за день). Ссылки на посты
-    работают и в публичном канале (t.me/<имя>/<id>), и в приватном
-    (t.me/c/<внутренний id>/<id> — открывается у подписчиков).
+    rows — db.posted_since(): {job_id, title, company, salary, chan_msg_id}
+    (уже с LIMIT — показываем не больше DIGEST_ITEMS_MAX). total — сколько
+    постов вышло за окно ВСЕГО (db.posted_count_since, включая закрытые);
+    None — считаем по самим строкам. Порядок старые→новые (как читается
+    канал за день). Ссылки на посты работают и в публичном канале
+    (t.me/<имя>/<id>), и в приватном (t.me/c/<внутренний id>/<id> —
+    открывается у подписчиков).
     """
     head = f"📋 <b>Вакансии дня</b> — {_date_ru(now_msk)}\n"
     if not rows:
         return head + "\nСегодня новых вакансий не было — загляните завтра."
+    items = rows[:DIGEST_ITEMS_MAX]
     lines = []
-    for i, r in enumerate(rows[:DIGEST_ITEMS_MAX], start=1):
+    for i, r in enumerate(items, start=1):
         title = E(str(r.get("title") or "вакансия").strip() or "вакансия")
         meta = " · ".join(x for x in (
             str(r.get("company") or "").strip(),
@@ -69,7 +74,9 @@ def render_channel_digest(rows: list[dict], link_base: str, now_msk: datetime) -
         if meta:
             line += f" — <i>{E(meta)}</i>"
         lines.append(line)
-    tail = f"\nВсего за день: {len(rows)}" if len(rows) > len(rows[:DIGEST_ITEMS_MAX]) else ""
+    if total is None:
+        total = len(rows)
+    tail = f"\nВсего за день: {total}" if total > len(items) else ""
     return head + "\n" + "\n".join(lines) + tail
 
 
@@ -123,8 +130,11 @@ async def maybe_scheduled(cfg, db, sender) -> None:
                 datetime.now(timezone.utc) - timedelta(days=1)
             ).isoformat(timespec="seconds")
             rows = db.posted_since(since, DIGEST_ITEMS_MAX)
+            # полный счётчик — «Всего за день: N» даже когда показываем 10
+            total = db.posted_count_since(since)
             try:
-                html = render_channel_digest(rows, await _link_base(sender.bot, target), msk)
+                html = render_channel_digest(
+                    rows, await _link_base(sender.bot, target), msk, total=total)
                 await sender.send_text(target, html)
                 db.set_setting("chandigest_since", datetime.now(timezone.utc).isoformat(timespec="seconds"))
                 db.set_setting("chandigest_date", today)
