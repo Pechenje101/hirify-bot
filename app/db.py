@@ -37,6 +37,10 @@ DEFAULT_DISPLAY = "auto"
 # такую вакансию нельзя считать обработанной, иначе она потеряется навсегда.
 RETRYABLE_STATUSES = ("send_failed", "fetch_failed", "new")
 
+# Для дайджеста (/digest) не показываем: посты-не-вакансии (болтовня каналов),
+# скам и fetch_failed — страницы, которые так и не прочитали (данных нет).
+DIGEST_HIDDEN_STATUSES = ("skipped_not_vacancy", "skipped_scam", "fetch_failed")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id      INTEGER PRIMARY KEY,
@@ -159,6 +163,35 @@ class Database:
                 (job_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def recent_jobs(
+        self,
+        limit: int = 12,
+        exclude: Iterable[str] = DIGEST_HIDDEN_STATUSES,
+    ) -> list[dict]:
+        """Самые свежие вакансии (новые сверху) — кандидаты дайджеста /digest.
+
+        Сортировка по first_seen DESC (записи одну секундой — job_id DESC как
+        развязка). exclude — статусы, которые человеку показывать не нужно
+        (не-вакансии, скам, нечитанные страницы); сами строки в БД остаются
+        для /stats и дедупликации. tg_contacts — уже материализованные в БД
+        контакты (рассылка в auto-режиме или кнопка «контакты»): дайджест
+        читает их из кэша и НЕ ходит на сайт за новыми.
+        """
+        ex = tuple(exclude)
+        q = (
+            "SELECT job_id, slug, url, title, company, salary, tg_contacts,"
+            " first_seen, sent_at, status FROM jobs"
+        )
+        args: list = []
+        if ex:
+            q += " WHERE status NOT IN (" + ",".join("?" * len(ex)) + ")"
+            args.extend(ex)
+        q += " ORDER BY first_seen DESC, job_id DESC LIMIT ?"
+        args.append(limit)
+        with _LOCK:
+            rows = self.conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
 
     def add_job(
         self,

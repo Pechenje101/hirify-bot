@@ -16,6 +16,10 @@ from . import texts
 from .cards import demo_vacancy
 from .config import Feed
 from .db import DEFAULT_DISPLAY, DISPLAY_MODES
+from .digest import (
+    DIGEST_CANDIDATES, DIGEST_DEFAULT, DIGEST_MAX,
+    render_digest, selection_keyboard, selection_text, sessions, suggest,
+)
 from .hirify import HirifyAutomationError, HirifyRestrictedError
 from .monitor import POLL_JITTER
 from .parsing import _api_contacts
@@ -525,6 +529,135 @@ async def on_contacts_button(cb: CallbackQuery, services: Services):
         await cb.answer("Не получилось достать контакты — попробуйте позже", show_alert=True)
     else:
         await cb.answer()
+
+
+# ---------------------------------------------------------------- /digest
+# Дайджест последних вакансий одной карточкой: бот предлагает состав
+# (предвыбраны последние 5), кнопками его можно править — и «Составить».
+# Контакты — только уже материализованные в БД: новых auth-запросов нет.
+
+
+@router.message(Command("digest"))
+async def cmd_digest(message: Message, command: CommandObject, services: Services):
+    """Дайджест последних вакансий: сначала — выбор состава кнопками."""
+    if not await _ensure_private(message):
+        return
+    services.db.add_subscriber(
+        message.chat.id, message.from_user.username if message.from_user else None
+    )
+    want = DIGEST_DEFAULT
+    if command.args:
+        try:
+            want = max(1, min(DIGEST_MAX, int(command.args.split()[0])))
+        except (ValueError, IndexError):
+            pass
+    rows = services.db.recent_jobs(DIGEST_CANDIDATES)
+    if not rows:
+        await message.answer(texts.DIGEST_EMPTY, parse_mode="HTML")
+        return
+    sel = suggest([int(r["job_id"]) for r in rows], min(want, len(rows)))
+    sessions.start(message.chat.id, rows, sel)
+    await message.answer(
+        selection_text(rows, sel),
+        reply_markup=selection_keyboard(rows, sel),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _digest_reselect(
+    cb: CallbackQuery, services: Services, st,
+) -> None:
+    """Перерисовать сообщение выбора после смены отметок."""
+    if cb.message is None:
+        return
+    try:
+        await cb.message.edit_text(
+            selection_text(st.rows, st.sel),
+            reply_markup=selection_keyboard(st.rows, st.sel),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:  # noqa: BLE001 — сообщение могли удалить: тост всё скажет
+        pass
+
+
+@router.callback_query(F.data.startswith("dgt:"))
+async def on_digest_toggle(cb: CallbackQuery, services: Services):
+    """Кнопка-тумблер вакансии в составе дайджеста."""
+    if cb.message is None or cb.message.chat.type != "private":
+        await cb.answer("🔒 Дайджест работает только в личном чате", show_alert=True)
+        return
+    try:
+        job_id = int(str(cb.data or "").split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    ok, note = sessions.toggle(cb.message.chat.id, job_id)
+    if not ok:
+        await cb.answer(note, show_alert=note.startswith("Сессия") or "не из этого" in note)
+        return
+    st = sessions.get(cb.message.chat.id)
+    if st is not None:
+        await _digest_reselect(cb, services, st)
+    await cb.answer(note)
+
+
+@router.callback_query(F.data == "dgtgo")
+async def on_digest_compose(cb: CallbackQuery, services: Services):
+    """«Составить дайджест»: печатаем карточку из выбранных вакансий."""
+    if cb.message is None or cb.message.chat.type != "private":
+        await cb.answer("🔒 Дайджест работает только в личном чате", show_alert=True)
+        return
+    chat_id = cb.message.chat.id
+    st = sessions.get(chat_id)
+    if st is None:
+        await cb.answer("Сессия устарела — вызовите /digest заново", show_alert=True)
+        return
+    if not st.sel:
+        await cb.answer("Отметьте хотя бы одну вакансию кнопками выше", show_alert=True)
+        return
+    rows = [r for r in st.rows if int(r["job_id"]) in st.sel]
+    html, markup = render_digest(rows)
+    sessions.drop(chat_id)
+    try:
+        await services.sender.send_text(chat_id, html, markup=markup)
+    except Exception:  # noqa: BLE001 — флад-контроль/сеть: сессию придётся собрать заново
+        log.warning("Дайджест: не доставился в чат %s", chat_id)
+        await cb.answer("Не получилось отправить — попробуйте ещё раз", show_alert=True)
+        return
+    if cb.message is not None:
+        try:
+            await cb.message.edit_text("✅ Дайджест отправлен — см. сообщение ниже", parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+    await cb.answer()
+
+
+@router.callback_query(F.data == "dgtrs")
+async def on_digest_reset(cb: CallbackQuery, services: Services):
+    """«Последние 5»: вернуть предложение бота после экспериментов."""
+    if cb.message is None or cb.message.chat.type != "private":
+        await cb.answer("🔒 Дайджест работает только в личном чате", show_alert=True)
+        return
+    st = sessions.reset(cb.message.chat.id)
+    if st is None:
+        await cb.answer("Сессия устарела — вызовите /digest заново", show_alert=True)
+        return
+    await _digest_reselect(cb, services, st)
+    await cb.answer("↩️ Вернул предложение бота")
+
+
+@router.callback_query(F.data == "dgtcl")
+async def on_digest_cancel(cb: CallbackQuery, services: Services):
+    """«Отмена»: закрываем сессию выбора и убираем клавиатуру."""
+    if cb.message is not None:
+        sessions.drop(cb.message.chat.id)
+        try:
+            await cb.message.edit_text("Дайджест отменён — /digest начать заново", parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+    await cb.answer()
 
 
 @router.message(Command("pause"))
