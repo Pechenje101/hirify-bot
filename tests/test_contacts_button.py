@@ -16,7 +16,6 @@ from app.config import Config  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.hirify import HirifyAutomationError, HirifyRestrictedError  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
-from app.parsing import Vacancy  # noqa: E402
 from app.services import Services  # noqa: E402
 from app.handlers import fetch_contacts_for_job  # noqa: E402
 

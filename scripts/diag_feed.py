@@ -25,7 +25,7 @@ from app.config import load_config  # noqa: E402
 from app.hirify import (  # noqa: E402
     HirifyAutomationError, HirifyAuthError, HirifyClient, HirifyError,
 )
-from app.parsing import CRYPTO_RE, INDUSTRY_RE, vacancy_from_api  # noqa: E402
+from app.parsing import vacancy_from_api  # noqa: E402
 
 DEEP = int(os.getenv("DIAG_DEEP", "20"))
 
@@ -121,7 +121,7 @@ async def main() -> int:
                 print(f"  ✓ [{feed.key:<5}] «{v.title[:58]}» — ПРОШЛА бы в рассылку "
                       f"(контакты фид гарантирует)")
 
-        print(f"\n—— ИТОГ воронки ——")
+        print("\n—— ИТОГ воронки ——")
         print(f"в фидах: {len(unique)} уникальных вакансий (страница 1 каждого раздела)")
         print(f"разобрано полных: {checked}; ошибок/пауз: {errors}")
         print(f"прошло бы все фильтры: {len(passed)}")

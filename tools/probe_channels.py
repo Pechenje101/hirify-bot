@@ -18,7 +18,6 @@ CLI: python tools/probe_channels.py [имя1 имя2 …]  (по умолчан�
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 

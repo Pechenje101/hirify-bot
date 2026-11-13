@@ -91,7 +91,7 @@ async def main() -> int:
                 for m2 in re.finditer(r".{0,60}" + kw + r".{0,60}", js[:2_000_000], re.I):
                     auth_hits.append(m2.group(0).replace("\n", " ")[:130])
         print(f"  API-пути из бандлов: {sorted(api_paths)[:30]}")
-        print(f"  auth-упоминания (первые 12): ")
+        print("  auth-упоминания (первые 12): ")
         for h in auth_hits[:12]:
             print(f"    {h}")
 

@@ -347,21 +347,78 @@ class Monitor:
             self._pause_just_expired = False
 
     async def _poll_impl(self, source: str, max_jobs: int) -> dict:
+        """Один проход, разложенный на именованные фазы (каждая — экран кода):
+
+        _sweep_pages (гигиена БД + «метла» глубины) → _collect_links
+        (источники) → _dedup_fresh (дедуп) → _apply_freshness (свежесть) →
+        конвейер каждой вакансии: _process_channel_post (посты ТГ-каналов)
+        или _process_hirify_job (элементы фида hirify).
+        """
         stats = self._new_stats()
 
-        # 0.5) гигиена БД — раз в сутки, ПЕРЕД основным разбором: старьё
-        #      прочь + VACUUM сжимает файл ДО того, как этот ран закоммитит
-        #      БД в git. Дедупу достаточно свежего окна, а раны замещают
-        #      друг друга — маркер даты живёт в БД (см. _db_prune_due).
+        pages = self._sweep_pages()
+
+        links = await self._collect_links(pages, stats)
+        if links is None:  # флаг автоматизации прилетел уже на запросе фида
+            return stats
+
+        fresh = self._apply_freshness(self._dedup_fresh(links), stats)
+        if not fresh:
+            log.debug("Новых вакансий нет")
+            return stats
+
+        # без подписчиков открывать вакансии смысла нет — экономим запросы
+        subscribers = self.db.subscriber_settings()
+        if not subscribers:
+            log.debug("Подписчиков нет — новые вакансии пропускаю (вернутся как ретрай)")
+            return stats
+
+        # после флага «автоматизация» закрыты только auth-запросы (данные
+        # вакансии и контакты от имени аккаунта) — АНОНИМНЫЙ путь (публичные
+        # страницы вакансий) продолжает доставлять; ТГ-каналы под флаг
+        # hirify не попадают — их обрабатываем всегда.
+        tg_rows = [row for row in fresh if getattr(row[3], "source", "hirify") == "tg"]
+        hy_rows = [row for row in fresh if getattr(row[3], "source", "hirify") != "tg"]
+        paused = time.time() < self._automation_until
+        if paused:
+            log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии hirify только через публичные страницы, auth не трогаем",
+                     self.automation_left_sec / 60)
+            stats["automation_pause"] = True
+
+        fresh = tg_rows + hy_rows[:max_jobs]
+        log.info("[%s] новых вакансий: %d (лимит %d, источники: %s)", source, len(fresh), max_jobs,
+                 ", ".join(f.key for f in self.cfg.feeds))
+
+        for job_id, slug, url, feed, item in fresh:
+            # пост ТГ-канала: отдельный конвейер (детектор вакансии →
+            # parse_vacancy_text → карточки), hirify-API не трогаем вовсе
+            if getattr(feed, "source", "hirify") == "tg":
+                await self._process_channel_post(job_id, slug, url, feed, item, stats, subscribers)
+                continue
+            if await self._process_hirify_job(
+                job_id, slug, url, feed, item, subscribers, paused, len(fresh), stats,
+            ):
+                break  # квота/флаг — остаток пачки доберёт следующий проход
+        return stats
+
+    def _sweep_pages(self) -> int:
+        """(0.5)+(0) подготовка прохода: гигиена БД и «метла» — сколько
+        страниц фида читать.
+
+        Гигиена БД — раз в сутки, ПЕРЕД основным разбором: старьё прочь +
+        VACUUM сжимает файл ДО того, как этот ран закоммитит БД в git.
+        Дедупу достаточно свежего окна, а раны замещают друг друга — маркер
+        даты живёт в БД (см. _db_prune_due).
+
+        «Метла» — глубокий первый проход (catchup_feed_pages), чтобы хвост
+        бэклога не ушёл со страницы 1 навсегда. Два повода, один раз в сутки:
+        (а) пауза автоматизации только что истекла — вакансии копились, пока
+        сайт держал флаг; (б) утро после ночного затишья — «человек проснулся
+        и пролистал ленту с запасом». Метка даты в БД — «метла» не
+        повторяется каждый проход и переживает замещение ранов.
+        """
         if self._db_prune_due():
             self._db_prune()
-
-        # 0) «метла» — глубокий первый проход (catchup_feed_pages), чтобы хвост
-        # бэклога не ушёл со страницы 1 навсегда. Два повода, один раз в сутки:
-        # (а) пауза автоматизации только что истекла — вакансии копились, пока
-        # сайт держал флаг; (б) утро после ночного затишья — «человек проснулся
-        # и пролистал ленту с запасом». Метка даты в БД — «метла» не
-        # повторяется каждый проход и переживает замещение ранов.
         pages = self.cfg.feed_pages
         if 0 < self._automation_until <= time.time():
             pages = max(pages, self.cfg.catchup_feed_pages)
@@ -374,13 +431,19 @@ class Monitor:
             pages = max(pages, self.cfg.catchup_feed_pages)
             self.db.set_setting("deep_sweep_date", self._today_msk())
             log.info("Утренний проход после ночи — фид «метлой»: %d стр. на раздел", pages)
+        return pages
 
-        # 1) источники: фид каждого раздела hirify — из JSON-API АНОНИМНО
-        #    (cookie не тратим: круглосуточный поллинг не должен накрывать
-        #    аккаунт): только вакансии с прямыми TG-контактами, серверная
-        #    фильтрация; ТГ-каналы — анонимное веб-превью t.me/s/<имя>
-        #    (одна страница последних постов; «метла» глубины каналов не
-        #    касается: свежесть постов ограничена окном FRESH_WINDOW_MIN)
+    async def _collect_links(self, pages: int, stats: dict) -> Optional[list]:
+        """(1) источники: фид каждого раздела hirify — из JSON-API АНОНИМНО
+        (cookie не тратим: круглосуточный поллинг не должен накрывать
+        аккаунт): только вакансии с прямыми TG-контактами, серверная
+        фильтрация; ТГ-каналы — анонимное веб-превью t.me/s/<имя>
+        (одна страница последних постов; «метла» глубины каналов не
+        касается: свежесть постов ограничена окном FRESH_WINDOW_MIN).
+
+        None — сайт пометил автоматизацию уже на запросе ФИДА: пауза
+        поставлена (см. _register_automation), проход останавливаем.
+        """
         links: list[tuple[int, str, str, object, dict]] = []  # (job_id, slug, url, feed, item)
         for feed in self.cfg.feeds:
             if getattr(feed, "source", "hirify") == "tg":
@@ -409,7 +472,7 @@ class Monitor:
                     subscribers = self.db.subscriber_settings()
                     self._register_automation(e, subscribers)
                     stats["automation_pause"] = True
-                    return stats
+                    return None
                 except HirifyError as e:
                     log.error("Не удалось загрузить фид «%s» (страница %d): %s", feed.key, page, e)
                     break
@@ -425,10 +488,16 @@ class Monitor:
                     links.append((job_id, short_slug, f"{self.cfg.hirify_base}/jobs/{full_slug}", feed, it))
                 if len(items) < 15:  # в странице фида 15 вакансий — дальше пусто
                     break
+        return links
 
-        # 2) оставляем только те, что ещё не видели (дедуп по всем разделам сразу;
-        #    send_failed/fetch_failed/new known_job_ids не вернёт — будет ретрай
-        #    'new' покрывает рестарт посреди прохода: незавершённые не теряются)
+    def _dedup_fresh(self, links: list) -> list:
+        """(2) оставить только невиданные: уникальные в рамках прохода и
+        отсутствующие в БД (дедуп по всем разделам сразу).
+
+        send_failed/fetch_failed/new known_job_ids не вернёт — будет
+        ретрай; 'new' покрывает рестарт посреди прохода: незавершённые
+        не теряются.
+        """
         seen_in_run: set[int] = set()
         unique: list[tuple[int, str, str, object, dict]] = []
         for row in links:
@@ -437,245 +506,248 @@ class Monitor:
             seen_in_run.add(row[0])
             unique.append(row)
         known = self.db.known_job_ids([job_id for job_id, _, _, _, _ in unique])
-        fresh = [row for row in unique if row[0] not in known]
+        return [row for row in unique if row[0] not in known]
 
-        # 2.5) СВЕЖЕСТЬ: «новая для бота» ≠ «недавно опубликованная». Фид с
-        # only_direct_contact обновляется редко: на странице 1 висят вакансии
-        # возрастом часы и дни (бэклог за паузы, «утренняя метла», переоткрытия),
-        # и если job_id мы раньше не видели — подписчику ушла бы карточка
-        # «опубликовано 03.11». Интересно только опубликованное недавно:
-        # всё старше границы свежести помечаем skipped_stale БЕЗ открытия
-        # вакансии (просмотры аккаунта не тратим) и навсегда — ретраить
-        # старьё незачем.
-        if self.cfg.fresh_window_min > 0:
-            threshold = self._fresh_threshold_ts()
-            kept: list[tuple[int, str, str, object, dict]] = []
-            for row in fresh:
-                if self._is_stale(row[4], threshold):
-                    self.db.add_job(row[0], row[1], row[2])
-                    self.db.mark_job(row[0], "skipped_stale")
-                    stats["stale"] += 1
-                else:
-                    kept.append(row)
-            if stats["stale"]:
-                log.info(
-                    "Свежесть: %d вакансий опубликованы раньше границы %s — пропущены",
-                    stats["stale"],
-                    datetime.fromtimestamp(threshold, tz=timezone.utc).strftime("%d.%m %H:%M UTC"),
-                )
-            fresh = kept
+    def _apply_freshness(self, fresh: list, stats: dict) -> list:
+        """(2.5) СВЕЖЕСТЬ: «новая для бота» ≠ «недавно опубликованная».
 
-        if not fresh:
-            log.debug("Новых вакансий нет")
-            return stats
+        Фид с only_direct_contact обновляется редко: на странице 1 висят
+        вакансии возрастом часы и дни (бэклог за паузы, «утренняя метла»,
+        переоткрытия), и если job_id мы раньше не видели — подписчику
+        ушла бы карточка «опубликовано 03.11». Интересно только
+        опубликованное недавно: всё старше границы свежести помечаем
+        skipped_stale БЕЗ открытия вакансии (просмотры аккаунта не
+        тратим) и навсегда — ретраить старьё незачем.
+        """
+        if self.cfg.fresh_window_min <= 0:
+            return fresh
+        threshold = self._fresh_threshold_ts()
+        kept: list[tuple[int, str, str, object, dict]] = []
+        for row in fresh:
+            if self._is_stale(row[4], threshold):
+                self.db.add_job(row[0], row[1], row[2])
+                self.db.mark_job(row[0], "skipped_stale")
+                stats["stale"] += 1
+            else:
+                kept.append(row)
+        if stats["stale"]:
+            log.info(
+                "Свежесть: %d вакансий опубликованы раньше границы %s — пропущены",
+                stats["stale"],
+                datetime.fromtimestamp(threshold, tz=timezone.utc).strftime("%d.%m %H:%M UTC"),
+            )
+        return kept
 
-        # без подписчиков открывать вакансии смысла нет — экономим запросы
-        subscribers = self.db.subscriber_settings()
-        if not subscribers:
-            log.debug("Подписчиков нет — новые вакансии пропускаю (вернутся как ретрай)")
-            return stats
+    async def _process_hirify_job(
+        self, job_id: int, slug: str, url: str, feed, item: dict,
+        subscribers: list[dict], paused: bool, jobs_in_run: int, stats: dict,
+    ) -> bool:
+        """(3) один элемент фида hirify: префильтр → адресаты → анонимный
+        путь (публичная страница) → кнопочный режим или auth-конвейер.
 
-        # после флага «автоматизация» закрыты только auth-запросы (данные
-        # вакансии и контакты от имени аккаунта) — АНОНИМНЫЙ путь (публичные
-        # страницы вакансий) продолжает доставлять; ТГ-каналы под флаг
-        # hirify не попадают — их обрабатываем всегда.
-        tg_rows = [row for row in fresh if getattr(row[3], "source", "hirify") == "tg"]
-        hy_rows = [row for row in fresh if getattr(row[3], "source", "hirify") != "tg"]
-        paused = time.time() < self._automation_until
-        if paused:
-            log.info("Пауза после флага автоматизации (ещё %.0f мин) — вакансии hirify только через публичные страницы, auth не трогаем",
-                     self.automation_left_sec / 60)
-            stats["automation_pause"] = True
+        Возврат True — остановить проход (квота аккаунта исчерпана или
+        сайт пометил автоматизацию): остальные вакансии останутся 'new'
+        и доберутся следующим проходом.
+        """
+        self.db.add_job(job_id, slug, url)
+        stats["total"] += 1
+        full_slug = f"{job_id}-{slug}"
 
-        # 3) обрабатываем каждую вакансию: сначала публичная страница БЕЗ
-        #    cookie (контакт чаще всего виден в SEO-разметке), при неудаче —
-        #    API от имени аккаунта (квоты и пауза флага касаются только его);
-        #    посты каналов бесплатны и их немного за окно
-        fresh = tg_rows + hy_rows[:max_jobs]
-        log.info("[%s] новых вакансий: %d (лимит %d, источники: %s)", source, len(fresh), max_jobs,
-                 ", ".join(f.key for f in self.cfg.feeds))
+        # ДЕШЁВЫЙ ПРЕФИЛЬТР: элемент фида уже содержит title/tldr/
+        # стек/флаги скама — «мимо индустрии» видно без открытия
+        # вакансии. Каждый пропущенный GET — минус один просмотр
+        # аккаунта (и минус один повод для флага автоматизации).
+        reason = self._prefilter_reason(item, feed)
+        if reason:
+            self.db.mark_job(job_id, reason)
+            stats["filtered"] += 1
+            log.debug("job %d: префильтр фида → %s (без открытия вакансии)", job_id, reason)
+            return False
 
-        for job_id, slug, url, feed, item in fresh:
-            # пост ТГ-канала: отдельный конвейер (детектор вакансии →
-            # parse_vacancy_text → карточки), hirify-API не трогаем вовсе
-            if getattr(feed, "source", "hirify") == "tg":
-                await self._process_channel_post(job_id, slug, url, feed, item, stats, subscribers)
-                continue
+        # Адресатов нет — не открываем вовсе: ни анонимный GET, ни
+        # auth-просмотры (feed_key вакансии = раздел, где она найдена)
+        recipients = self._recipients_for_key(feed.key, subscribers)
+        if not recipients:
+            self.db.mark_job(job_id, "sent")
+            stats["no_audience"] += 1
+            log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
+                      job_id, feed.key)
+            return False
 
-            self.db.add_job(job_id, slug, url)
-            stats["total"] += 1
-            full_slug = f"{job_id}-{slug}"
-
-            # ДЕШЁВЫЙ ПРЕФИЛЬТР: элемент фида уже содержит title/tldr/
-            # стек/флаги скама — «мимо индустрии» видно без открытия
-            # вакансии. Каждый пропущенный GET — минус один просмотр
-            # аккаунта (и минус один повод для флага автоматизации).
-            reason = self._prefilter_reason(item, feed)
-            if reason:
-                self.db.mark_job(job_id, reason)
-                stats["filtered"] += 1
-                log.debug("job %d: префильтр фида → %s (без открытия вакансии)", job_id, reason)
-                continue
-
-            # Адресатов нет — не открываем вовсе: ни анонимный GET, ни
-            # auth-просмотры (feed_key вакансии = раздел, где она найдена)
-            recipients = self._recipients_for_key(feed.key, subscribers)
-            if not recipients:
-                self.db.mark_job(job_id, "sent")
-                stats["no_audience"] += 1
-                log.debug("job %d: подписчиков раздела «%s» нет — обработана без доставки",
-                          job_id, feed.key)
-                continue
-
-            # --- АНОНИМНЫЙ ПУТЬ: публичная страница вакансии БЕЗ cookie.
-            # SEO-JSON-LD лендинга несёт ПОЛНОЕ описание вакансии, включая
-            # блок «Контакты: Telegram @handle», поэтому большинство вакансий
-            # уходит подписчикам вообще без запросов от имени аккаунта:
-            # сайту нечего считать и нечего флагать (анти-automation_detected).
-            v = None
-            if self.cfg.anon_first:
-                try:
-                    landing = await self.client.fetch_job(url)
-                    v = parse_job_page(landing, url)
-                    v.feed_key, v.feed_label = feed.key, feed.label
-                except Exception as e:  # noqa: BLE001 — не отдался/не разобрался → API-путь
-                    log.debug("job %d: анонимный лендинг не пригодился (%s) — API-путь", job_id, e)
-                if v is not None and v.has_direct_contact:
-                    skip = self._strict_filter_reason(v, feed)
-                    if skip:
-                        self.db.mark_job(job_id, skip)
-                        stats["filtered"] += 1
-                        log.debug("job %d: строгий фильтр по публичным данным → %s", job_id, skip)
-                        continue
-                    self.db.update_job_parsed(
-                        job_id, title=v.title, company=v.company, salary=v.salary,
-                        tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display}
-                                     for c in v.contacts],
-                    )
-                    stats["anon"] += 1
-                    log.info("job %d: контакт есть на публичной странице — доставлено без запросов аккаунта", job_id)
-                    await self._deliver_vacancy(job_id, v, recipients, stats)
-                    continue
-                # публичная страница контакта не дала → auth-путь ниже
-
-            # --- КНОПОЧНЫЙ РЕЖИМ (CONTACTS_MODE=button, ПО УМОЛЧАНИЮ):
-            # карточка уходит подписчику СЕЙЧАС из анонимных данных; контакт
-            # человек получит нажатием «Показать контакты» — один auth-запрос
-            # от живого интереса вместо пачки авто-просмотров. Именно пачки
-            # сайт и флажит (automation_detected), поэтому здесь их больше
-            # нет в принципе; пауза флага и квоты не касаются доставки.
-            if self.cfg.contacts_mode != "auto":
-                if v is None:
-                    # лендинг не отдался/не разобрался → карточка из полей
-                    # фида (короче, но без единого запроса аккаунта)
-                    v = vacancy_from_feed_item(item, url, feed)
-                skip = self._strict_filter_reason(v, feed)
-                if skip:
-                    self.db.mark_job(job_id, skip)
-                    stats["filtered"] += 1
-                    log.debug("job %d: строгий фильтр (кнопочный режим) → %s", job_id, skip)
-                    continue
-                if v.has_direct_contact:
-                    self.db.update_job_parsed(
-                        job_id, title=v.title, company=v.company, salary=v.salary,
-                        tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display}
-                                     for c in v.contacts],
-                    )
-                    stats["anon"] += 1
-                    log.info("job %d: контакт виден анонимно — доставлено без запросов аккаунта", job_id)
-                else:
-                    v.contacts_by_button = True
-                    self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
-                    stats["button"] += 1
-                    log.info("job %d: карточка доставлена — контакты по кнопке (ноль запросов аккаунта)", job_id)
-                await self._deliver_vacancy(job_id, v, recipients, stats)
-                continue
-
-            # --- ПАУЗА АВТОМАТИЗАЦИИ (только auto-режим): auth-запросы закрыты.
-            # Вакансия остаётся 'new' — вернётся ретраем, когда сайт снимет
-            # флаг; свежесть для публикаций, застрявших на паузе, расширена
-            # (см. _fresh_threshold_ts).
-            if paused:
-                continue
-
-            # квота запросов от имени аккаунта: сайт считает просмотры,
-            # и именно пачки подряд — «автоматизация». Остальные вакансии
-            # НЕ теряются: остаются невидимыми → следующий проход доберёт
-            block = self._auth_quota_block()
-            if block:
-                stats["quota_deferred"] += 1
-                log.info("Квота аккаунта (%s) — остальные %d вакансий подождут следующего прохода",
-                         block, len(fresh) - stats["total"])
-                break
-
-            # --- этап 1: данные вакансии (GET, от имени аккаунта). Фильтры
-            # ниже решаемы уже по ним — контакты запрашиваем только для
-            # прошедших отбор
-            try:
-                data = await self.client.fetch_vacancy(full_slug)
-            except Exception as e:  # noqa: BLE001
-                if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
-                    break
-                continue
-            self._auth_view_spent()
-            v = vacancy_from_api(data, None, feed.key, feed.label)
-
-            # помеченные сайтом как скам/подозрительные — не рассылаем
-            if data.get("is_scam") or data.get("is_potential_scam"):
-                self.db.mark_job(job_id, "skipped_scam")
-                stats["filtered"] += 1
-                log.info("job %d: помечен как скам — пропускаю", job_id)
-                continue
-
-            self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
-
-            # ФИЛЬТР 2+3: строгие проверки раздела (не-удалёнка, крипто-признаки)
-            # и целевых индустрий — общий с анонимным путём. Решается по данным
-            # вакансии — БЕЗ запроса контактов: их просмотры сайт считает,
-            # и именно они чаще всего и вызывают флаг «автоматизации»
+        # --- АНОНИМНЫЙ ПУТЬ: публичная страница вакансии БЕЗ cookie.
+        # SEO-JSON-LD лендинга несёт ПОЛНОЕ описание вакансии, включая
+        # блок «Контакты: Telegram @handle», поэтому большинство вакансий
+        # уходит подписчикам вообще без запросов от имени аккаунта:
+        # сайту нечего считать и нечего флагать (анти-automation_detected).
+        v = await self._landing_vacancy(job_id, url, feed) if self.cfg.anon_first else None
+        if v is not None and v.has_direct_contact:
             skip = self._strict_filter_reason(v, feed)
             if skip:
                 self.db.mark_job(job_id, skip)
                 stats["filtered"] += 1
-                log.debug("job %d: строгий фильтр → %s", job_id, skip)
-                continue
-
-            # рассылка: адресаты уже отобраны до открытия; контакты запрашиваем
-            # только после всех фильтров (просмотры не бесплатны)
-
-            # --- этап 2: контакты (POST, от имени аккаунта) — «дорогой» запрос,
-            # делаем его только для целевой вакансии с адресатами
-            try:
-                contacts_data = await self.client.fetch_contacts(full_slug)
-            except Exception as e:  # noqa: BLE001
-                if self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break":
-                    break
-                continue
-            self._auth_view_spent()
-
-            v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
-            # полный просмотр прошёл — флага больше нет; «сняли флаг»-
-            # сообщение шлём только если пауза только что истекла (не каждый чих)
-            self._automation_healed(subscribers, announce=self._pause_just_expired)
+                log.debug("job %d: строгий фильтр по публичным данным → %s", job_id, skip)
+                return False
             self.db.update_job_parsed(
                 job_id, title=v.title, company=v.company, salary=v.salary,
-                tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
+                tg_contacts=self._tg_contacts_json(v),
             )
-
-            # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
-            # (фид уже фильтрует only_direct_contact — это страховка; проблемы
-            # с самой сессией ловятся выше как HirifyAuthError)
-            if not v.has_direct_contact:
-                self.db.mark_job(job_id, "skipped_no_contact")
-                stats["skipped"] += 1
-                log.debug("job %d: TG-контакта нет — пропускаю", job_id)
-                continue
-
-            # считаем доставки — если НЕ УДАЛОСЬ НИ ОДНОЙ, вакансия
-            # не финализируется (send_failed) и уйдёт ретраем в следующем проходе
+            stats["anon"] += 1
+            log.info("job %d: контакт есть на публичной странице — доставлено без запросов аккаунта", job_id)
             await self._deliver_vacancy(job_id, v, recipients, stats)
+            return False
 
-        return stats
+        # --- КНОПОЧНЫЙ РЕЖИМ (CONTACTS_MODE=button, ПО УМОЛЧАНИЮ):
+        # карточка уходит подписчику СЕЙЧАС из анонимных данных; контакт
+        # человек получит нажатием «Показать контакты» — один auth-запрос
+        # от живого интереса вместо пачки авто-просмотров. Именно пачки
+        # сайт и флажит (automation_detected), поэтому здесь их больше
+        # нет в принципе; пауза флага и квоты не касаются доставки.
+        if self.cfg.contacts_mode != "auto":
+            await self._deliver_button_card(job_id, url, feed, item, v, recipients, stats)
+            return False
+
+        # --- ПАУЗА АВТОМАТИЗАЦИИ (только auto-режим): auth-запросы закрыты.
+        # Вакансия остаётся 'new' — вернётся ретраем, когда сайт снимет
+        # флаг; свежесть для публикаций, застрявших на паузе, расширена
+        # (см. _fresh_threshold_ts).
+        if paused:
+            return False
+
+        # квота запросов от имени аккаунта: сайт считает просмотры,
+        # и именно пачки подряд — «автоматизация». Остальные вакансии
+        # НЕ теряются: остаются невидимыми → следующий проход доберёт
+        block = self._auth_quota_block()
+        if block:
+            stats["quota_deferred"] += 1
+            log.info("Квота аккаунта (%s) — остальные %d вакансий подождут следующего прохода",
+                     block, jobs_in_run - stats["total"])
+            return True
+
+        return await self._process_auth_job(
+            job_id, full_slug, url, feed, recipients, subscribers, stats,
+        )
+
+    async def _landing_vacancy(self, job_id: int, url: str, feed):
+        """Вакансия с публичной страницы БЕЗ cookie (анонимный путь).
+
+        None — не отдалась или не разобралась: дальше идёт API-путь.
+        """
+        try:
+            landing = await self.client.fetch_job(url)
+            v = parse_job_page(landing, url)
+            v.feed_key, v.feed_label = feed.key, feed.label
+            return v
+        except Exception as e:  # noqa: BLE001 — не отдался/не разобрался → API-путь
+            log.debug("job %d: анонимный лендинг не пригодился (%s) — API-путь", job_id, e)
+            return None
+
+    async def _deliver_button_card(
+        self, job_id: int, url: str, feed, item: dict, v,
+        recipients: list[dict], stats: dict,
+    ) -> None:
+        """Кнопочный режим: карточка подписчику сейчас — из анонимных данных
+        (лендинг, а если не отдался — из полей фида), контакт по кнопке
+        «Показать контакты» (ноль запросов аккаунта).
+        """
+        if v is None:
+            # лендинг не отдался/не разобрался → карточка из полей
+            # фида (короче, но без единого запроса аккаунта)
+            v = vacancy_from_feed_item(item, url, feed)
+        skip = self._strict_filter_reason(v, feed)
+        if skip:
+            self.db.mark_job(job_id, skip)
+            stats["filtered"] += 1
+            log.debug("job %d: строгий фильтр (кнопочный режим) → %s", job_id, skip)
+            return
+        if v.has_direct_contact:
+            self.db.update_job_parsed(
+                job_id, title=v.title, company=v.company, salary=v.salary,
+                tg_contacts=self._tg_contacts_json(v),
+            )
+            stats["anon"] += 1
+            log.info("job %d: контакт виден анонимно — доставлено без запросов аккаунта", job_id)
+        else:
+            v.contacts_by_button = True
+            self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
+            stats["button"] += 1
+            log.info("job %d: карточка доставлена — контакты по кнопке (ноль запросов аккаунта)", job_id)
+        await self._deliver_vacancy(job_id, v, recipients, stats)
+
+    async def _process_auth_job(
+        self, job_id: int, full_slug: str, url: str, feed,
+        recipients: list[dict], subscribers: list[dict], stats: dict,
+    ) -> bool:
+        """auto-режим, запросы от имени аккаунта: этап 1 (данные вакансии) →
+        фильтры → этап 2 (контакты, только для прошедших отбор) → доставка.
+
+        Возврат True — прервать проход (флаг автоматизации).
+        """
+        # --- этап 1: данные вакансии (GET, от имени аккаунта). Фильтры
+        # ниже решаемы уже по ним — контакты запрашиваем только для
+        # прошедших отбор
+        try:
+            data = await self.client.fetch_vacancy(full_slug)
+        except Exception as e:  # noqa: BLE001
+            return self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break"
+        self._auth_view_spent()
+        v = vacancy_from_api(data, None, feed.key, feed.label)
+
+        # помеченные сайтом как скам/подозрительные — не рассылаем
+        if data.get("is_scam") or data.get("is_potential_scam"):
+            self.db.mark_job(job_id, "skipped_scam")
+            stats["filtered"] += 1
+            log.info("job %d: помечен как скам — пропускаю", job_id)
+            return False
+
+        self.db.update_job_parsed(job_id, title=v.title, company=v.company, salary=v.salary)
+
+        # ФИЛЬТР 2+3: строгие проверки раздела (не-удалёнка, крипто-признаки)
+        # и целевых индустрий — общий с анонимным путём. Решается по данным
+        # вакансии — БЕЗ запроса контактов: их просмотры сайт считает,
+        # и именно они чаще всего и вызывают флаг «автоматизации»
+        skip = self._strict_filter_reason(v, feed)
+        if skip:
+            self.db.mark_job(job_id, skip)
+            stats["filtered"] += 1
+            log.debug("job %d: строгий фильтр → %s", job_id, skip)
+            return False
+
+        # --- этап 2: контакты (POST, от имени аккаунта) — «дорогой» запрос,
+        # делаем его только для целевой вакансии с адресатами
+        try:
+            contacts_data = await self.client.fetch_contacts(full_slug)
+        except Exception as e:  # noqa: BLE001
+            return self._handle_fetch_error(e, job_id, url, stats, subscribers) == "break"
+        self._auth_view_spent()
+
+        v = vacancy_from_api(data, contacts_data, feed.key, feed.label)
+        # полный просмотр прошёл — флага больше нет; «сняли флаг»-
+        # сообщение шлём только если пауза только что истекла (не каждый чих)
+        self._automation_healed(subscribers, announce=self._pause_just_expired)
+        self.db.update_job_parsed(
+            job_id, title=v.title, company=v.company, salary=v.salary,
+            tg_contacts=self._tg_contacts_json(v),
+        )
+
+        # ФИЛЬТР 1: только вакансии с прямым Telegram-контактом
+        # (фид уже фильтрует only_direct_contact — это страховка; проблемы
+        # с самой сессией ловятся выше как HirifyAuthError)
+        if not v.has_direct_contact:
+            self.db.mark_job(job_id, "skipped_no_contact")
+            stats["skipped"] += 1
+            log.debug("job %d: TG-контакта нет — пропускаю", job_id)
+            return False
+
+        # считаем доставки — если НЕ УДАЛОСЬ НИ ОДНОЙ, вакансия
+        # не финализируется (send_failed) и уйдёт ретраем в следующем проходе
+        await self._deliver_vacancy(job_id, v, recipients, stats)
+        return False
+
+    @staticmethod
+    def _tg_contacts_json(v) -> list[dict]:
+        """Контакты Vacancy в формате БД (update_job_parsed/tg_contacts)."""
+        return [{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts]
+
 
     async def _process_channel_post(
         self, job_id: int, slug: str, url: str, feed, item: dict, stats: dict, subscribers: list[dict],
@@ -707,7 +779,7 @@ class Monitor:
         )
         self.db.update_job_parsed(
             job_id, title=v.title, company=v.company, salary=v.salary,
-            tg_contacts=[{"kind": c.kind, "value": c.value, "display": c.display} for c in v.contacts],
+            tg_contacts=self._tg_contacts_json(v),
         )
 
         # индустриальный фильтр каналов — отдельный выключатель (по умолчанию

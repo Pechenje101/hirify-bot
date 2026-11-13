@@ -19,7 +19,6 @@ from app.reports import (  # noqa: E402
     channel_post_link, maybe_scheduled, render_channel_digest,
     render_week_report,
 )
-from app.textparse import parse_vacancy_text  # noqa: E402
 
 ADMIN = 1
 CHANNEL = -1001234

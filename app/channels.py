@@ -20,7 +20,6 @@ CPA/маркетинг, пейменты) плотнее живут в тема�
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import zlib
 from html.parser import HTMLParser

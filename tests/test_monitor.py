@@ -482,7 +482,7 @@ def test_premium_vacancies_finalized_without_retry():
     premium = PremiumClient(FEED_ITEMS, VACANCIES)
     mon.client = premium
     for _ in range(2):
-        stats = asyncio.run(mon.poll_once(source="test"))
+        asyncio.run(mon.poll_once(source="test"))
     assert db.job_status(101) == "skipped_restricted"
     assert db.job_attempts(101) == 0
     # первый проход открыл все три вакансии, второй — ни одной (все финальны)
@@ -557,7 +557,6 @@ def test_automation_backoff_escalates_and_survives_restart():
     """Пауза автоматизации живёт в БД (переживает замещение ранов) и растёт
     с каждым повторным срабатыванием — не кормим флаг постоянными попытками."""
     from app.hirify import HirifyAutomationError
-    from app.monitor import AUTOMATION_BACKOFF_MIN
 
     class FlaggedClient(FakeClient):
         async def fetch_contacts(self, slug):
@@ -869,7 +868,7 @@ def test_prefilter_disabled_opens_everything():
     mon.cfg.feed_prefilter = False
     spy = FakeClient(items, api)
     mon.client = spy
-    stats = asyncio.run(mon.poll_once(source="test"))
+    asyncio.run(mon.poll_once(source="test"))
     assert spy.job_fetches == 1           # открыли, чтобы понять: мимо индустрии
     assert db.job_status(204) == "skipped_off_industry"
     db.close()

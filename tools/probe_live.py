@@ -63,8 +63,8 @@ async def probe_job(url: str, client: HirifyClient) -> None:
         print(f"    • [{c.kind}] {c.display} -> {c.url} (найден в: {c.source})")
     links = raw_analysis(html)
     print(f"  t.me-ссылок в сыром HTML: {len(links)}")
-    for l in links[:15]:
-        print(f"    {l}")
+    for link in links[:15]:
+        print(f"    {link}")
     print(f"  маркеры скрытия: {len(MARKERS_RE.findall(html))} шт.")
     m = JSONLD_RE.search(html)
     if m:
@@ -81,7 +81,7 @@ async def probe_job(url: str, client: HirifyClient) -> None:
         print(f"  контекст Show contacts: ...{html[max(0, i-200):i+300]!r}...")
 
     # оригинальный пост в канале: t.me/<канал>/<id> из сырого HTML
-    post = next((l for l in links if re.search(r"/\d+$", l)), None)
+    post = next((link for link in links if re.search(r"/\d+$", link)), None)
     if post:
         section(f"ОРИГИНАЛ В КАНАЛЕ (публичное превью): {post}")
         for variant in (post, post.replace("://t.me/", "://t.me/s/")):
@@ -91,8 +91,8 @@ async def probe_job(url: str, client: HirifyClient) -> None:
                 mentions = re.findall(r"@[A-Za-z][A-Za-z0-9_]{3,31}", page)
                 print(f"  {variant} -> HTTP {code}, {len(page)} байт, "
                       f"t.me-ссылок: {len(found)}, @упоминаний: {len(mentions)}")
-                for l in found[:10]:
-                    print(f"    t.me: {l}")
+                for link in found[:10]:
+                    print(f"    t.me: {link}")
                 for mm in sorted(set(mentions))[:10]:
                     print(f"    mention: {mm}")
             except Exception as e:  # noqa: BLE001

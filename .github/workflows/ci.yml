@@ -16,5 +16,7 @@ jobs:
           python-version: "3.12"
       - name: Установка зависимостей
         run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Линт (ruff: app/, tests/, tools/, scripts/)
+        run: ruff check .
       - name: Тесты
         run: pytest -q

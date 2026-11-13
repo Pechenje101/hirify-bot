@@ -676,7 +676,7 @@ async def on_digest_cancel(cb: CallbackQuery, services: Services):
 
 @router.callback_query(F.data.startswith("mod:"))
 async def on_moderation_button(cb: CallbackQuery, services: Services):
-    """Кнопки панели модерации: решение владельца по вакансии."""
+    """Кнопки панели модерации: парсинг payload + гарда владельца → ветка."""
     parts = (cb.data or "").split(":")
     if len(parts) != 3:
         await cb.answer()
@@ -694,61 +694,78 @@ async def on_moderation_button(cb: CallbackQuery, services: Services):
         await cb.answer("Модерация — только для владельца бота", show_alert=True)
         return
     if action == "ok":
-        out = await publish_job(job_id, services)
-        if out in ("ok", "already"):
-            job = services.db.get_job(job_id) or {}
-            title = html_mod.escape(str(job.get("title") or "вакансия"))
-            if out == "ok":
-                note = f"✅ Опубликовано в канал\n<b>{title}</b>"
-                if int(job.get("chan_msg_id") or 0):
-                    note += f"\nПост №{job['chan_msg_id']}"
-            else:
-                note = f"☑️ Уже опубликована\n<b>{title}</b>"
-            # панель управления постом (закрыть/удалить) — только для живого поста
-            markup = manage_keyboard(job_id) if int(job.get("chan_msg_id") or 0) else None
-            await _mod_done(cb, note, services, markup)
-            await cb.answer("✅ Опубликовано" if out == "ok" else "Уже опубликована")
-        elif out == "nochan":
-            await cb.answer("Канал не задан: /setchannel <@имя или -100…>", show_alert=True)
-        elif out == "noid":
-            await cb.answer("Вакансия уже не найдена в базе", show_alert=True)
-        elif out == "nopayload":
-            await cb.answer("Данные карточки не сохранились — пропустите вакансию", show_alert=True)
-        else:
-            await cb.answer("Не получилось отправить (бот — админ канала?) — попробуйте позже", show_alert=True)
-        return
-    if action == "close":
-        out = await close_job(job_id, services)
-        if out == "ok":
-            job = services.db.get_job(job_id) or {}
-            await _mod_done(cb, "🔒 Вакансия закрыта\n<b>" +
-                            html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
-            await cb.answer("🔒 Закрыта — замочек в посте, кнопки сняты")
-        elif out == "already":
-            await cb.answer("Уже закрыта/решена")
-        else:
-            await cb.answer("Не получилось закрыть (пост ещё жив?) — попробуйте позже", show_alert=True)
-        return
-    if action == "del":
-        out = await delete_post(job_id, services)
-        if out == "ok":
-            job = services.db.get_job(job_id) or {}
-            await _mod_done(cb, "🗑 Пост удалён из канала\n<b>" +
-                            html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
-            await cb.answer("🗑 Пост удалён")
-        elif out == "already":
-            await cb.answer("Поста уже нет")
-        else:
-            await cb.answer("Не получилось удалить — попробуйте позже", show_alert=True)
-        return
-    if action == "no":
-        services.db.set_mod(job_id, "no")
+        await _mod_publish(cb, job_id, services)
+    elif action == "close":
+        await _mod_close(cb, job_id, services)
+    elif action == "del":
+        await _mod_delete(cb, job_id, services)
+    elif action == "no":
+        await _mod_reject(cb, job_id, services)
+    else:
+        await cb.answer()
+
+
+async def _mod_publish(cb: CallbackQuery, job_id: int, services: Services) -> None:
+    """«✅ Опубликовать»: карточка в канал, панель → управление постом."""
+    out = await publish_job(job_id, services)
+    if out in ("ok", "already"):
         job = services.db.get_job(job_id) or {}
         title = html_mod.escape(str(job.get("title") or "вакансия"))
-        await _mod_done(cb, f"❌ Отклонено\n<b>{title}</b>", services)
-        await cb.answer("❌ Отклонено")
-        return
-    await cb.answer()
+        if out == "ok":
+            note = f"✅ Опубликовано в канал\n<b>{title}</b>"
+            if int(job.get("chan_msg_id") or 0):
+                note += f"\nПост №{job['chan_msg_id']}"
+        else:
+            note = f"☑️ Уже опубликована\n<b>{title}</b>"
+        # панель управления постом (закрыть/удалить) — только для живого поста
+        markup = manage_keyboard(job_id) if int(job.get("chan_msg_id") or 0) else None
+        await _mod_done(cb, note, services, markup)
+        await cb.answer("✅ Опубликовано" if out == "ok" else "Уже опубликована")
+    elif out == "nochan":
+        await cb.answer("Канал не задан: /setchannel <@имя или -100…>", show_alert=True)
+    elif out == "noid":
+        await cb.answer("Вакансия уже не найдена в базе", show_alert=True)
+    elif out == "nopayload":
+        await cb.answer("Данные карточки не сохранились — пропустите вакансию", show_alert=True)
+    else:
+        await cb.answer("Не получилось отправить (бот — админ канала?) — попробуйте позже", show_alert=True)
+
+
+async def _mod_close(cb: CallbackQuery, job_id: int, services: Services) -> None:
+    """«🔒 Закрыть»: вакансия снята с набора — в посте замочек, кнопки сняты."""
+    out = await close_job(job_id, services)
+    if out == "ok":
+        job = services.db.get_job(job_id) or {}
+        await _mod_done(cb, "🔒 Вакансия закрыта\n<b>" +
+                        html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
+        await cb.answer("🔒 Закрыта — замочек в посте, кнопки сняты")
+    elif out == "already":
+        await cb.answer("Уже закрыта/решена")
+    else:
+        await cb.answer("Не получилось закрыть (пост ещё жив?) — попробуйте позже", show_alert=True)
+
+
+async def _mod_delete(cb: CallbackQuery, job_id: int, services: Services) -> None:
+    """«🗑 Удалить»: пост из канала убран, карточки подписчиков остаются."""
+    out = await delete_post(job_id, services)
+    if out == "ok":
+        job = services.db.get_job(job_id) or {}
+        await _mod_done(cb, "🗑 Пост удалён из канала\n<b>" +
+                        html_mod.escape(str(job.get("title") or "вакансия")) + "</b>", services)
+        await cb.answer("🗑 Пост удалён")
+    elif out == "already":
+        await cb.answer("Поста уже нет")
+    else:
+        await cb.answer("Не получилось удалить — попробуйте позже", show_alert=True)
+
+
+async def _mod_reject(cb: CallbackQuery, job_id: int, services: Services) -> None:
+    """«❌ Отклонить»: в канал не уходит, решение фиксируется в БД."""
+    services.db.set_mod(job_id, "no")
+    job = services.db.get_job(job_id) or {}
+    title = html_mod.escape(str(job.get("title") or "вакансия"))
+    await _mod_done(cb, f"❌ Отклонено\n<b>{title}</b>", services)
+    await cb.answer("❌ Отклонено")
 
 
 async def _mod_done(cb: CallbackQuery, text: str, services: Services, markup=None) -> None:
@@ -837,51 +854,16 @@ async def cmd_setchannel(message: Message, command: CommandObject, services: Ser
         return
     raw = (command.args or "").strip()
     if not raw:
-        cur = moderation_target(services.cfg, services.db)
-        if cur:
-            await message.answer(
-                f"📡 Канал публикаций: <code>{cur}</code>\n"
-                "Модерация включена — новые карточки идут с панелями.\n"
-                "Сменить: /setchannel &lt;@имя&gt; · выключить: /setchannel off",
-                parse_mode="HTML",
-            )
-        else:
-            await message.answer(
-                "📡 Канал публикаций не задан.\n\n"
-                "1) Добавьте бота админом в канал с правом отправки сообщений\n"
-                "2) /setchannel &lt;@имя канала или -100…&gt; — или просто напишите\n"
-                "    что-нибудь в канале: бот привяжет его сам и пришлёт\n"
-                "    уведомление\n\n"
-                "После этого каждая карточка будет приходить с кнопками"
-                " «✅ Опубликовать» / «❌ Отклонить», а решённые — поститься"
-                " в канал нативно, без «Переслано от…».",
-                parse_mode="HTML",
-            )
+        await _setchannel_show(message, services)
         return
     if raw.lower() in ("off", "none", "0"):
         services.db.set_setting("post_channel_id", "")
         await message.answer("⏸ Канал публикаций отключён — модерация выключена.\n"
                              "Очередь сохранена: /pending покажет после включения.")
         return
-    if raw.lstrip("-").isdigit():
-        chat_id = int(raw)
-    elif raw.startswith("@") and len(raw) > 1:
-        try:
-            chat = await message.bot.get_chat(raw)
-            chat_id = chat.id
-        except Exception as e:  # noqa: BLE001 — имя не резолвится
-            await message.answer(
-                f"❌ Не нашёл канал {html_mod.escape(raw)}: {e}\n\n"
-                "Проверьте имя (и что бот уже добавлен админом) или пришлите"
-                " числовой id вида -1001234567890.", parse_mode="HTML")
-            return
-    else:
-        await message.answer(
-            "❌ Не понял аргумент. Примеры:\n"
-            "<code>/setchannel @my_vacancy_channel</code>\n"
-            "<code>/setchannel -1001234567890</code>\n"
-            "<code>/setchannel off</code>", parse_mode="HTML")
-        return
+    chat_id = await _resolve_channel_id(raw, message)
+    if chat_id is None:
+        return  # ошибка разбора аргумента уже отправлена пользователю
     services.db.set_setting("post_channel_id", str(chat_id))
     await message.answer(
         f"✅ Канал публикаций: <code>{chat_id}</code>\n\n"
@@ -890,6 +872,52 @@ async def cmd_setchannel(message: Message, command: CommandObject, services: Ser
         "Очередь решений: /pending · выключить: /setchannel off",
         parse_mode="HTML",
     )
+
+
+async def _setchannel_show(message: Message, services: Services) -> None:
+    """Без аргумента: текущий канал или инструкция по включению."""
+    cur = moderation_target(services.cfg, services.db)
+    if cur:
+        await message.answer(
+            f"📡 Канал публикаций: <code>{cur}</code>\n"
+            "Модерация включена — новые карточки идут с панелями.\n"
+            "Сменить: /setchannel &lt;@имя&gt; · выключить: /setchannel off",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            "📡 Канал публикаций не задан.\n\n"
+            "1) Добавьте бота админом в канал с правом отправки сообщений\n"
+            "2) /setchannel &lt;@имя канала или -100…&gt; — или просто напишите\n"
+            "    что-нибудь в канале: бот привяжет его сам и пришлёт\n"
+            "    уведомление\n\n"
+            "После этого каждая карточка будет приходить с кнопками"
+            " «✅ Опубликовать» / «❌ Отклонить», а решённые — поститься"
+            " в канал нативно, без «Переслано от…».",
+            parse_mode="HTML",
+        )
+
+
+async def _resolve_channel_id(raw: str, message: Message) -> int | None:
+    """Аргумент /setchannel → числовой id канала (None — уже ответили ошибкой)."""
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    if raw.startswith("@") and len(raw) > 1:
+        try:
+            chat = await message.bot.get_chat(raw)
+            return chat.id
+        except Exception as e:  # noqa: BLE001 — имя не резолвится
+            await message.answer(
+                f"❌ Не нашёл канал {html_mod.escape(raw)}: {e}\n\n"
+                "Проверьте имя (и что бот уже добавлен админом) или пришлите"
+                " числовой id вида -1001234567890.", parse_mode="HTML")
+            return None
+    await message.answer(
+        "❌ Не понял аргумент. Примеры:\n"
+        "<code>/setchannel @my_vacancy_channel</code>\n"
+        "<code>/setchannel -1001234567890</code>\n"
+        "<code>/setchannel off</code>", parse_mode="HTML")
+    return None
 
 
 @router.message(Command("week"))

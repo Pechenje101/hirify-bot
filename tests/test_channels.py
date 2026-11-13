@@ -3,9 +3,8 @@
 Интеграционные тесты конвейера (пост → детектор → карточка → доставка)
 живут в test_monitor.py; здесь — блок channels.py и его парсер HTML.
 """
-import asyncio
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

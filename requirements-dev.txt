@@ -1,1 +1,2 @@
 pytest>=8.0
+ruff>=0.8          # линт-гейт CI: pyflakes + pycodestyle, конфиг — ruff.toml
