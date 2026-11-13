@@ -76,8 +76,12 @@ jobs:
           INDUSTRY_STRICT: '1'
           # источники-дополнение: публичные ТГ-КАНАЛЫ с вакансиями
           # (читаются анонимно через веб-превью t.me/s/<имя>). ВАЖНО: только
-          # каналы — у ЧАТОВ (напр. payments_lenkep) анонимного превью нет
-          TG_CHANNELS: 'cpa_people,opento_igaming,IT_iGaming,betting_job'
+          # каналы — у ЧАТОВ (напр. payments_lenkep) анонимного превью нет.
+          # 6 новых добавлены 13.11 после проверки: посты читаются, живые,
+          # у 5 из 6 — 60-94% вакансий с прямым @контактом (r2bwork
+          # отклонён: посты-заглушки; viva_aff не канал; blockchain_job/
+          # job_crypto_ru/GamblingServices мертвы с 2023).
+          TG_CHANNELS: 'cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs'
           # САЙТ ЗАМОРОЖЕН (решение владельца 12.11): hirify-фида нет вовсе —
           # ноль запросов к сайту (и аккаунт, и анонимных), флагу automation_
           # detected нечем срабатываться, cookie «отдыхает» до официального

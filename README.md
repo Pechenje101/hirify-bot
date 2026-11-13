@@ -281,8 +281,30 @@ HIRIFY_FEEDS=remote,global,crypto        # по умолчанию: все тр�
 Настройка — в `.env` / окружении воркфлоу:
 
 ```
-TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job
+TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs
 ```
+
+Подключённые каналы (все проверены анонимным чтением `t.me/s`, живые в 2026):
+
+| Канал | Тематика |
+|---|---|
+| `cpa_people` | CPA / аффмаркетинг |
+| `opento_igaming` | iGaming (LENKEP) |
+| `IT_iGaming` | IT в iGaming |
+| `betting_job` | ставки / гемблинг |
+| `igaming_work` | iGaming: affiliate / медиабаинг (формат NDA с ID) |
+| `igcwork` | iGaming: SEO / affiliate (тихий, ~пост в месяц) |
+| `cryptoheadhunter` | крипто / web3 / high-risk вертикали |
+| `fintech_vacancy` | финтех / платежи |
+| `HRCPAgram` | CPA / арбитраж трафика |
+| `holder_job_devs` | web3-разработка (EN, HIRING NOW с @контактом) |
+
+Проверено 13.11: у 5 новых из 6 — 60–94% постов-вакансий с прямым
+@контактом (производственный фильтр `has_direct_contact`). Отклонены:
+`r2bwork` (посты — заглушки-указатели, текстов вакансий нет), `viva_aff`
+(не канал), `blockchain_job` / `job_crypto_ru` / `GamblingServices` (мертвы
+с 2023), англоязычные борды `cryptojobslist` / `web3hiring` (ведения на
+сайт без прямых TG-контактов — отсеялись бы как skipped_no_contact).
 
 Элемент списка — имя канала, `@имя`, `https://t.me/имя` или `https://t.me/s/имя`.
 Каждый канал становится отдельным «разделом» в ⚙️ `/settings`
