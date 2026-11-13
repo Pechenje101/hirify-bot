@@ -74,15 +74,6 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
--- отклики читателей канала (кнопка «Откликнуться» на посте → deep-link в бота):
--- пара (job_id, user_id) уникальна — считаем уникальных откликнувшихся, а не клики
-CREATE TABLE IF NOT EXISTS applies (
-    job_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    ts     TEXT NOT NULL,
-    PRIMARY KEY (job_id, user_id)
-);
 """
 
 
@@ -104,6 +95,12 @@ class Database:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA busy_timeout=5000")
             self.conn.executescript(SCHEMA)
+            # 13.11 (вечер): воронка «Откликнуться» убрана — кнопка на постах
+            # канала больше не ведёт в личку бота (читатель остаётся в канале,
+            # пишет рекрутеру его кнопкой). Таблицу откликов и кеш username
+            # бота сносим: код их больше не читает и не пишет.
+            self.conn.execute("DROP TABLE IF EXISTS applies")
+            self.conn.execute("DELETE FROM settings WHERE key='bot_username'")
             # миграция старых баз: колонка attempts
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
             if "attempts" not in cols:
@@ -458,48 +455,6 @@ class Database:
             # (межисточниковый дедуп — в комментариях к parsing.dedup_hash)
             "duplicates": by_status.get("skipped_duplicate", 0),
         }
-
-    # ---------- отклики (кнопка «Откликнуться» на посте в канале) ----------
-
-    def add_apply(self, job_id: int, user_id: int) -> bool:
-        """Зафиксировать отклик читателя канала (deep-link /start job_…).
-        Возвращает True, если отклик новый (повторные клики того же человека
-        не накручивают счётчик — пара job_id+user_id уникальна)."""
-        with _LOCK:
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO applies (job_id, user_id, ts) VALUES (?,?,?)",
-                (job_id, user_id, _now()),
-            )
-            self.conn.commit()
-        return bool(cur.rowcount)
-
-    def applies_count(self, job_id: int) -> int:
-        """Уникальных откликнувшихся на вакансию (счётчик у поста/в отчётах)."""
-        with _LOCK:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM applies WHERE job_id=?", (job_id,)
-            ).fetchone()
-        return int(row["n"] or 0)
-
-    def applies_since(self, since_iso: str) -> int:
-        """Всего откликов за окно (недельная аналитика)."""
-        with _LOCK:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM applies WHERE ts>=?", (since_iso,)
-            ).fetchone()
-        return int(row["n"] or 0)
-
-    def top_applied(self, since_iso: str, limit: int = 3) -> list[dict]:
-        """Топ вакансий по откликам за окно: [{job_id, title, company, clicks}]."""
-        with _LOCK:
-            rows = self.conn.execute(
-                "SELECT a.job_id AS job_id, COUNT(*) AS clicks, j.title AS title,"
-                " j.company AS company FROM applies a"
-                " LEFT JOIN jobs j ON j.job_id = a.job_id"
-                " WHERE a.ts>=? GROUP BY a.job_id ORDER BY clicks DESC, a.job_id LIMIT ?",
-                (since_iso, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     # ---------- аналитика канала (дайджест дня / недельный отчёт) ----------
 

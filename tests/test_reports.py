@@ -92,19 +92,14 @@ def test_channel_post_link_internal_format():
     assert channel_post_link("https://t.me/c/1234", 7) == "https://t.me/c/1234/7"
 
 
-def test_render_week_report_counts_and_top():
+def test_render_week_report_counts():
     db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"), 3)
     db.mark_channel_post_gone(1002, "closed")  # один пост закрыт — считаем вышедшим
-    # отклики: у 1001 — двое, у 1003 — один (у закрытого кликов нет)
-    db.add_apply(1001, 10)
-    db.add_apply(1001, 11)
-    db.add_apply(1003, 12)
     db.add_job(2000, "s", "https://t.me/x/2000", title="В очереди")
     db.save_moderation(2000, "{}")  # висит в очереди
     html = render_week_report(db, msk())
     assert "Постов в канале: <b>3</b>" in html    # posted+closed за окно
-    assert "откликов: <b>3</b>" in html
-    assert "Senior Engineer 1" in html and "<b>2</b> откл." in html
+    assert "откликов" not in html                 # воронки «Откликнуться» больше нет
     assert "в очереди 1" in html
     db.close()
 

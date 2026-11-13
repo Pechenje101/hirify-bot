@@ -4,8 +4,9 @@
    одним постом — все активные вакансии, опубликованные за сутки, ссылками
    на сами посты. Читатели получают «вечернюю сводку», канал — ритм;
 2) НЕДЕЛЬНАЯ АНАЛИТИКА ВЛАДЕЛЬЦУ (воскресенье 20:00 МСК, WEEK_REPORT_HOUR=0
-   — выключить): постов за неделю, откликов (кнопки «📨 Откликнуться»),
-   топ-3 вакансии по откликам, состояние очереди. Компасс содержания.
+   — выключить): посты за неделю и состояние конвейера (очередь/закрытые/
+   отклонённые). Компасс содержания. (Метрика откликов убрана вместе
+   с кнопкой «Откликнуться» — решение владельца 13.11.)
 
 Оба триггера проверяются в цикле монитора (не чаще прохода), маркеры
 «когда отправляли последний раз» живут в БД — раны Actions самозамещаются,
@@ -76,20 +77,11 @@ def render_week_report(db, now_msk: datetime) -> str:
     """Недельная сводка конвейера канала — в личку владельцу."""
     since = (now_msk - timedelta(days=7)).astimezone(timezone.utc).isoformat(timespec="seconds")
     posts = db.posted_count_since(since)
-    applies = db.applies_since(since)
-    top = db.top_applied(since, limit=3)
     st = db.moderation_stats()
     end = _date_ru(now_msk)
     start = _date_ru(now_msk - timedelta(days=6))
     out = [f"📊 <b>Неделя канала</b> — {start}…{end}\n"]
-    out.append(f"Постов в канале: <b>{posts}</b> · откликов: <b>{applies}</b>")
-    if top:
-        out.append("\nТоп вакансий по откликам:")
-        for i, r in enumerate(top, start=1):
-            title = str(r.get("title") or "").strip() or "вакансия"
-            company = str(r.get("company") or "").strip()
-            who = f"{E(title)}" + (f" · {E(company)}" if company else "")
-            out.append(f"{i}. {who} — <b>{int(r['clicks'])}</b> откл.")
+    out.append(f"Постов в канале: <b>{posts}</b>")
     out.append(
         f"\nВсего по конвейеру: опубликовано {st['posted']} · закрыто {st['closed']}"
         f" · отклонено {st['rejected']} · в очереди {st['queue']}"

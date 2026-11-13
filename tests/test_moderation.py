@@ -40,18 +40,11 @@ class FakeSender:
         self.vacancies: list = []
         self.displays: list[str] = []
         self.texts: list[tuple[int, str, object]] = []
-        self.extra_rows: list = []          # ряды кнопок у постов в канал
         self.fail_vacancy = fail_vacancy
-        # «Bot»: get_me для кнопки отклика, edit/delete для закрытия/удаления
+        # «Bot»: edit/delete для закрытия/удаления постов канала
         class _Bot:
-            username = "hirify_bot"
             edited: list = []
             deleted: list = []
-
-            async def get_me(self):
-                class _Me:
-                    username = self.username
-                return _Me()
 
             async def edit_message_text(self, chat_id, message_id, text, **kw):
                 self.edited.append((chat_id, message_id, text, kw.get("reply_markup")))
@@ -64,13 +57,12 @@ class FakeSender:
         self.bot = _Bot()
 
     async def send_vacancy(self, chat_id, v, *, silent=False, display="auto",
-                           extra_row=None, want_message=False):
+                           want_message=False):
         if self.fail_vacancy:
             raise RuntimeError("bot is not admin")
         self.sent.append((chat_id, v.title))
         self.vacancies.append(v)
         self.displays.append(display)
-        self.extra_rows.append(extra_row)
         return ("classic", 4242) if want_message else "classic"
 
     async def send_text(self, chat_id, html, markup=None):
@@ -284,10 +276,6 @@ def test_publish_job_ok_and_full_card():
     sent_v = sender.vacancies[0]
     assert sent_v.description == v.description
     assert sent_v.contacts[0].value == v.contacts[0].value
-    # КНОПКА ОТКЛИКА: ряд доп. кнопок у поста + deep-link на этого бота
-    row = sender.extra_rows[0]
-    assert row and row[0].url == f"https://t.me/hirify_bot?start=job_101"
-    assert row[0].text == "📨 Откликнуться"
     # id поста и время записаны (закрыть/удалить/дайджест дня)
     job = db.get_job(101)
     assert job["mod_status"] == "posted" and job["chan_msg_id"] == 4242
@@ -370,19 +358,11 @@ def test_close_and_delete_post():
     db.close()
 
 
-def test_manage_keyboard_and_applies():
-    """Панель управления постом + счёт уникальных откликов."""
+def test_manage_keyboard():
+    """Панель управления постом: закрыть / удалить."""
     kb = manage_keyboard(123)
     datas = {b.callback_data for row in kb.inline_keyboard for b in row}
     assert datas == {"mod:close:123", "mod:del:123"}
-
-    db = Database(Path(tempfile.mkdtemp(prefix="hirify_mod_")) / "t.db")
-    # первый отклик новый, повторные того же юзера — нет; другой юзер — да
-    assert db.add_apply(123, 10) is True
-    assert db.add_apply(123, 10) is False
-    assert db.add_apply(123, 11) is True
-    assert db.applies_count(123) == 2
-    db.close()
 
 
 def test_queue_for_moderation_direct():

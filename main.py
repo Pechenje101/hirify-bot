@@ -83,15 +83,6 @@ async def run() -> None:
         await bot.set_my_commands(BOT_COMMANDS)
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось установить меню команд: %s", e)
-    # username бота — для кнопок «📨 Откликнуться» на постах канала
-    # (deep-link t.me/<бот>?start=job_<id>); кеш в БД, раны его перечитывают
-    try:
-        me = await bot.get_me()
-        if me.username:
-            db.set_setting("bot_username", me.username)
-    except Exception as e:  # noqa: BLE001 — кнопка отклика не критична
-        log.warning("Не удалось узнать username бота: %s", e)
-
     # фоновый мониторинг + приём команд
     monitor_task = asyncio.create_task(monitor.run_forever())
     log.info("Бот запущен. Cookie: %s", "есть" if client.has_cookie else "нет (см. /help)")

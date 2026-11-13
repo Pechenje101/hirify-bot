@@ -7,12 +7,12 @@
    кнопками «✅ Опубликовать» / «❌ Отклонить»;
 2) «Опубликовать» — карточка отправляется в канал нативным постом тем же
    конвейером (sender.send_vacancy, вид как в /settings владельца, с
-   автооткатом bubble→rich→классика). Карточка ЧИСТАЯ — без футера-источника
-   и хештегов (решение владельца 13.11). Под карточкой — кнопка
-   «📨 Откликнуться» (deep-link в бота: полная карточка + счётчик отклика),
-   запоминаются id поста и время (posted_at, chan_msg_id);
+   автооткатом bubble→rich→классика). Карточка ЧИСТАЯ — как в рассылке:
+   без футера-источника и хештегов, единственная кнопка — «Написать
+   рекрутеру» (воронки «Откликнуться» в личку бота больше нет — решение
+   владельца 13.11). Запоминаются id поста и время (posted_at, chan_msg_id);
 3) после публикации панель решения сменяется панелью управления:
-   «🔒 Закрыть» (правит пост: замочек, кнопка отклика снята) и
+   «🔒 Закрыть» (правит пост: замочек, кнопки сняты) и
    «🗑 Удалить пост»;
 4) очередь и решения живут в БД (jobs.mod_status): /pending показывает
    нерешённые панели заново после любого рестарта.
@@ -105,8 +105,8 @@ def panel_keyboard(job_id: int) -> InlineKeyboardMarkup:
 
 def manage_keyboard(job_id: int) -> InlineKeyboardMarkup:
     """Панель УПРАВЛЕНИЯ опубликованным постом (вместо панели решения):
-    закрыть вакансию (дописать «🔒 закрыта», снять кнопку отклика) или
-    удалить пост из канала совсем."""
+    закрыть вакансию (дописать «🔒 закрыта», снять кнопки) или удалить
+    пост из канала совсем."""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"mod:close:{job_id}"),
         InlineKeyboardButton(text="🗑 Удалить пост", callback_data=f"mod:del:{job_id}"),
@@ -141,34 +141,6 @@ async def queue_for_moderation(
         log.warning("Панель модерации job %s не ушла: %s", job_id, e)
 
 
-async def _apply_button(job_id: int, services) -> list | None:
-    """Ряд с кнопкой «📨 Откликнуться» для поста в канале.
-
-    Deep-link t.me/<бот>?start=job_<id>: читатель канала попадает в личку
-    бота, получает полную карточку с контактами — и попадает в воронку
-    (отклик считается в applies). Имя бота кешируется в БД при старте рана;
-    если недоступно (get_me не прошёл) — пост уйдёт без кнопки, деградация
-    мягкая. None — кнопки не будет.
-    """
-    uname = (services.db.get_setting("bot_username", "") or "").strip().lstrip("@")
-    if not uname:
-        try:
-            me = await services.sender.bot.get_me()
-            uname = (me.username or "").strip()
-            if uname:
-                services.db.set_setting("bot_username", uname)
-        except Exception as e:  # noqa: BLE001 — кнопка отклика не критична
-            log.warning("Не удалось узнать username бота (кнопки отклика не будет): %s", e)
-            return None
-    if not uname:
-        return None
-    return [InlineKeyboardButton(
-        text="📨 Откликнуться",
-        url=f"https://t.me/{uname}?start=job_{job_id}",
-        style="primary",  # акцентная синяя — главный призыв канала
-    )]
-
-
 async def publish_job(job_id: int, services) -> str:
     """Опубликовать вакансию из очереди в канал. Исходы:
 
@@ -194,10 +166,9 @@ async def publish_job(job_id: int, services) -> str:
         return "nopayload"
     sub = db.subscriber(cfg.admin_chat_id) if cfg.admin_chat_id else None
     display = sub["display"] if sub else DEFAULT_DISPLAY
-    extra_row = await _apply_button(job_id, services)
     try:
         _mode, msg_id = await services.sender.send_vacancy(
-            target, v, display=display, extra_row=extra_row, want_message=True,
+            target, v, display=display, want_message=True,
         )
     except Exception as e:  # noqa: BLE001 — бот не админ / флад / сеть
         log.warning("Публикация job %s в канал %s не прошла: %s", job_id, target, e)
@@ -211,7 +182,8 @@ CLOSE_SUFFIX = "\n\n🔒 <b>Вакансия закрыта</b> — отклик
 
 async def close_job(job_id: int, services) -> str:
     """Закрыть вакансию: редактирует пост в канале (дописывает замочек,
-    снимает кнопку отклика). Исходы как у publish_job плюс:
+    снимает кнопки — рекрутеру больше писать не нужно). Исходы как у
+    publish_job плюс:
 
     'already' — уже закрыта/решена;
     'nomsg' — id поста не записан (пост вышел без записи id) — править нечего;
@@ -238,7 +210,7 @@ async def close_job(job_id: int, services) -> str:
             text=render_classic_html(v) + CLOSE_SUFFIX,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=None,  # кнопка отклика снята — вакансия закрыта
+            reply_markup=None,  # кнопки сняты — вакансия закрыта
         )
     except Exception as e:  # noqa: BLE001 — пост могли удалить руками
         log.warning("Закрытие вакансии job %s не прошло: %s", job_id, e)
