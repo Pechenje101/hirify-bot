@@ -17,7 +17,7 @@ from app.config import Config  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.reports import (  # noqa: E402
     channel_post_link, maybe_scheduled, render_channel_digest,
-    render_week_report,
+    render_week_report, resolve_digest,
 )
 
 ADMIN = 1
@@ -39,7 +39,7 @@ class FakeSender:
     async def send_text(self, chat_id, html, markup=None):
         if getattr(self, "fail", False):
             raise RuntimeError("fl00d")
-        self.texts.append((chat_id, html))
+        self.texts.append((chat_id, html, markup))
 
     async def send_vacancy(self, chat_id, v, **kw):
         return "classic"
@@ -133,12 +133,20 @@ def test_maybe_scheduled_sends_digest_once():
     R._msk_now = lambda: msk()
     try:
         asyncio.run(maybe_scheduled(cfg, db, sender))   # воскресенье 21:00
-        assert len(sender.texts) == 2                   # дайджест + недельный отчёт
+        assert len(sender.texts) == 2                   # проект дайджеста + недельный отчёт
         dg = sender.texts[0]
-        assert dg[0] == CHANNEL and "Вакансии дня" in dg[1]
+        assert dg[0] == ADMIN and "Вакансии дня" in dg[1]
         assert dg[1].count("t.me/my_vac_chan/") == 2    # ссылки на посты
+        assert "Проект вечернего дайджеста" in dg[1]
+        labels = {b.text for row in dg[2].inline_keyboard for b in row}
+        assert labels == {"✅ Опубликовать в канал", "❌ Не надо"}
         wk = sender.texts[1]
         assert wk[0] == ADMIN and "Неделя канала" in wk[1]
+        # ГЛАВНОЕ (решение владельца 15.11): в канал не уходит ничего без апрува
+        assert all(t[0] != CHANNEL for t in sender.texts)
+        # проект сохранён в БД — кнопка переживает рестарты ранов
+        assert "Вакансии дня" in db.get_setting("chandigest_draft", "")
+        assert db.get_setting("chandigest_draft_date", "") == "2026-11-08"
         # маркеры дня/недели проставлены — повторный вызов НЕ дублирует
         asyncio.run(maybe_scheduled(cfg, db, sender))
         assert len(sender.texts) == 2
@@ -154,12 +162,12 @@ def test_maybe_scheduled_guards_hour_and_switches():
     import app.reports as R
     orig = R._msk_now
 
-    # 20:59 — ни дайджеста (порог 21), ни отчёта (порог 20, но не воскресенье? —
+    # 20:59 — ни проекта дайджеста (порог 21), ни отчёта (порог 20, но не воскресенье? —
     # оно и есть воскресенье; проверяем именно порог часа дайджеста)
     R._msk_now = lambda: msk(hour=20)
     try:
         asyncio.run(maybe_scheduled(make_cfg(), db, sender))
-        assert len([t for t in sender.texts if t[0] == CHANNEL]) == 0
+        assert len([t for t in sender.texts if "Вакансии дня" in t[1]]) == 0
         assert len([t for t in sender.texts if t[0] == ADMIN]) == 1  # отчёт ушёл
         # выключенный дайджест/отчёт (0) — вообще ничего
         sender2 = FakeSender()
@@ -187,6 +195,133 @@ def test_maybe_scheduled_failure_keeps_marker():
         asyncio.run(maybe_scheduled(cfg, db, sender))
         assert db.get_setting("chandigest_date") != ""    # теперь поставлен
         assert len(sender.texts) == 1
+        assert sender.texts[0][0] == ADMIN                 # проект — владельцу, не в канал
     finally:
         R._msk_now = orig
+    db.close()
+
+
+# ------------------------------------------------ проект дайджеста (15.11)
+
+def test_maybe_scheduled_no_posts_no_proposal():
+    """Постов не было — проекта нет и маркер дня не ставится: появится пост,
+    сводку предложат тем же вечером. Пустой «сводки дня» в канал не существует."""
+    db = Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db")
+    db.set_setting("post_channel_id", str(CHANNEL))
+    sender = FakeSender()
+    cfg = make_cfg(week_hour=0)
+    import app.reports as R
+    orig = R._msk_now
+    R._msk_now = lambda: msk()
+    try:
+        asyncio.run(maybe_scheduled(cfg, db, sender))
+        assert sender.texts == []
+        assert db.get_setting("chandigest_date", "") == ""
+        seed_posted(db, 1)                                # пост появился позже того же вечера…
+        asyncio.run(maybe_scheduled(cfg, db, sender))
+        assert len(sender.texts) == 1 and sender.texts[0][0] == ADMIN
+    finally:
+        R._msk_now = orig
+    db.close()
+
+
+def _services(db, sender=None):
+    return SimpleNamespace(cfg=make_cfg(week_hour=0), db=db,
+                           sender=sender or FakeSender())
+
+
+def test_resolve_digest_approve_posts_to_channel():
+    """«Опубликовать» — проект уходит в канал ровно как в превью, окно закрыто."""
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"))
+    db.set_setting("post_channel_id", str(CHANNEL))
+    db.set_setting("chandigest_draft", "сводка")
+    db.set_setting("chandigest_draft_date", "2026-11-08")
+    sender = FakeSender()
+    since_before = db.get_setting("chandigest_since", "")
+    assert asyncio.run(resolve_digest("ok", "2026-11-08", _services(db, sender))) == "ok"
+    assert sender.texts == [(CHANNEL, "сводка", None)]
+    assert db.get_setting("chandigest_draft", "") == ""
+    assert db.get_setting("chandigest_since", "") != since_before   # окно закрыто
+    db.close()
+
+
+def test_resolve_digest_reject_and_stale():
+    """Отказ: в канал не уходит, окно закрыто; чужая дата — панель устарела."""
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"))
+    db.set_setting("post_channel_id", str(CHANNEL))
+    db.set_setting("chandigest_draft", "сводка")
+    db.set_setting("chandigest_draft_date", "2026-11-08")
+    sender = FakeSender()
+    # чужая дата — ничего не меняется
+    assert asyncio.run(resolve_digest("ok", "2026-11-07", _services(db, sender))) == "stale"
+    assert sender.texts == [] and db.get_setting("chandigest_draft", "") == "сводка"
+    # отказ: в канал не уходит, проект снят, окно закрыто
+    assert asyncio.run(resolve_digest("no", "2026-11-08", _services(db, sender))) == "rejected"
+    assert sender.texts == []
+    assert db.get_setting("chandigest_draft", "") == ""
+    assert db.get_setting("chandigest_since", "") != ""
+    # проекта больше нет — повторное нажатие ни к чему не приводит
+    assert asyncio.run(resolve_digest("ok", "2026-11-08", _services(db, sender))) == "nodraft"
+    db.close()
+
+
+def test_resolve_digest_fail_keeps_panel():
+    """Сбой поста — панель остаётся, нажатие можно повторить."""
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"))
+    db.set_setting("post_channel_id", str(CHANNEL))
+    db.set_setting("chandigest_draft", "сводка")
+    db.set_setting("chandigest_draft_date", "2026-11-08")
+    sender = FakeSender()
+    sender.fail = True
+    assert asyncio.run(resolve_digest("ok", "2026-11-08", _services(db, sender))) == "fail"
+    assert db.get_setting("chandigest_draft", "") == "сводка"   # панель жива
+    db.close()
+
+
+def test_resolve_digest_no_channel():
+    """Канал не задан — публикация невозможна, проект не сгорает."""
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"))
+    db.set_setting("chandigest_draft", "сводка")
+    db.set_setting("chandigest_draft_date", "2026-11-08")
+    sender = FakeSender()
+    assert asyncio.run(resolve_digest("ok", "2026-11-08", _services(db, sender))) == "nochan"
+    assert sender.texts == [] and db.get_setting("chandigest_draft", "") == "сводка"
+    db.close()
+
+
+def test_digest_button_guard_and_publish():
+    """Кнопка dgr: гарда владельца, публикация по апруву, снятие кнопок."""
+    from app.handlers import on_digest_button
+
+    db = seed_posted(Database(Path(tempfile.mkdtemp(prefix="hirify_rep_")) / "t.db"))
+    db.set_setting("post_channel_id", str(CHANNEL))
+    db.set_setting("chandigest_draft", "сводка")
+    db.set_setting("chandigest_draft_date", "2026-11-08")
+    sender = FakeSender()
+    sv = _services(db, sender)
+    answered: list = []
+
+    class _Msg:
+        stripped = False
+
+        async def edit_reply_markup(self, reply_markup=None):
+            self.stripped = True
+
+    def make_cb(uid, data):
+        async def answer(*args, **kw):
+            answered.append((args, kw))
+        return SimpleNamespace(data=data, from_user=SimpleNamespace(id=uid),
+                               message=_Msg(), answer=answer)
+
+    # чужой пользователь — гарда, в канал ничего не уходит
+    asyncio.run(on_digest_button(make_cb(999, "dgr:ok:2026-11-08"), sv))
+    assert answered[-1][1].get("show_alert") and sender.texts == []
+    # владелец: публикация — спокойный тост, кнопки панели сняты
+    cb = make_cb(ADMIN, "dgr:ok:2026-11-08")
+    asyncio.run(on_digest_button(cb, sv))
+    assert sender.texts == [(CHANNEL, "сводка", None)]
+    assert not answered[-1][1].get("show_alert")
+    assert cb.message.stripped is True
+    # мусорный callback — тихо
+    asyncio.run(on_digest_button(make_cb(ADMIN, "dgr:xx:1"), sv))
     db.close()

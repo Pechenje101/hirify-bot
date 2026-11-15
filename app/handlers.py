@@ -28,7 +28,7 @@ from .moderation import (
 )
 from .monitor import POLL_JITTER
 from .parsing import _api_contacts
-from .reports import render_week_report
+from .reports import render_week_report, resolve_digest
 from .services import Services
 from .textparse import looks_like_vacancy, parse_vacancy_text
 
@@ -694,6 +694,48 @@ async def on_digest_cancel(cb: CallbackQuery, services: Services):
 # Канал владельца: каждая карточка уходит в личку вместе с панелью
 # «✅ Опубликовать / ❌ Отклонить»; очередь живёт в БД (payload+mod_status),
 # так что раны Actions самозамещаются между доставкой и нажатием.
+
+
+@router.callback_query(F.data.startswith("dgr:"))
+async def on_digest_button(cb: CallbackQuery, services: Services):
+    """Кнопки проекта вечернего дайджеста: в канал — только по апруву владельца.
+
+    С 15.11 бот не постит в канал НИЧЕГО автоматически: сводка приходит
+    проектом в личку (maybe_scheduled), эта кнопка — единственный путь её
+    в канал. Решение живёт в БД (chandigest_*), рестарты ранов не страшны.
+    """
+    parts = (cb.data or "").split(":")  # dgr:<ok|no>:<дата проекта>
+    if len(parts) != 3 or parts[1] not in ("ok", "no"):
+        await cb.answer()
+        return
+    if (services.cfg.admin_chat_id and cb.from_user
+            and cb.from_user.id != services.cfg.admin_chat_id):
+        await cb.answer("Сводка — только для владельца бота", show_alert=True)
+        return
+    outcome = await resolve_digest(parts[1], parts[2], services)
+    if outcome == "ok":
+        await _strip_panel_keyboard(cb)
+        await cb.answer("Сводка опубликована в канал")
+    elif outcome == "rejected":
+        await _strip_panel_keyboard(cb)
+        await cb.answer("Отклонено — сводка в канал не уйдёт")
+    elif outcome == "nodraft":
+        await cb.answer("Сводка уже не актуальна", show_alert=True)
+    elif outcome == "stale":
+        await cb.answer("Панель устарела — уже предложена более свежая сводка", show_alert=True)
+    elif outcome == "nochan":
+        await cb.answer("Канал публикаций не задан (/setchannel)", show_alert=True)
+    else:  # fail — панель остаётся, нажатие можно повторить
+        await cb.answer("Не получилось отправить в канал — попробуйте ещё раз", show_alert=True)
+
+
+async def _strip_panel_keyboard(cb: CallbackQuery) -> None:
+    """Убрать кнопки решённой панели (превью сводки остаётся в чате)."""
+    if cb.message:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001 — уже без кнопок / сообщение удалено
+            pass
 
 
 @router.callback_query(F.data.startswith("mod:"))

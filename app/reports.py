@@ -1,12 +1,17 @@
 """Регулярные отчёты конвейера канала: дайджест дня и неделя владельцу.
 
-1) ВЕЧЕРНИЙ ДАЙДЖЕСТ КАНАЛА (по умолчанию 21:00 МСК, CHAN_DIGEST_HOUR):
-   одним постом — все активные вакансии, опубликованные за сутки, ссылками
-   на сами посты. Читатели получают «вечернюю сводку», канал — ритм;
+1) ВЕЧЕРНИЙ ДАЙДЖЕСТ (по умолчанию 21:00 МСК, CHAN_DIGEST_HOUR): с 15.11 —
+   ТОЛЬКО ПРОЕКТ в личку владельца с кнопками «✅ Опубликовать в канал» /
+   «❌ Не надо»: бот не постит в канал НИЧЕГО без апрува владельца (его
+   правило), сводка не исключение. Карточка проекта = будущий пост (тот же
+   HTML хранится в БД — кнопка переживает рестарты ранов), публикация —
+   только по нажатию (resolve_digest). Пустых сводок («за день не было
+   вакансий») больше нет вовсе.
 2) НЕДЕЛЬНАЯ АНАЛИТИКА ВЛАДЕЛЬЦУ (воскресенье 20:00 МСК, WEEK_REPORT_HOUR=0
    — выключить): посты за неделю и состояние конвейера (очередь/закрытые/
-   отклонённые). Компасс содержания. (Метрика откликов убрана вместе
-   с кнопкой «Откликнуться» — решение владельца 13.11.)
+   отклонённые). Компасс содержания. Приходит ТОЛЬКО владельцу в личку.
+   (Метрика откликов убрана вместе с кнопкой «Откликнуться» — решение
+   владельца 13.11.)
 
 Оба триггера проверяются в цикле монитора (не чаще прохода), маркеры
 «когда отправляли последний раз» живут в БД — раны Actions самозамещаются,
@@ -19,6 +24,8 @@ from __future__ import annotations
 import html as html_mod
 import logging
 from datetime import datetime, timedelta, timezone
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .moderation import moderation_target
 
@@ -112,6 +119,58 @@ async def _link_base(bot, target: int) -> str:
     return f"https://t.me/c/{inner}"
 
 
+def digest_keyboard(day: str) -> InlineKeyboardMarkup:
+    """Панель проекта дайджеста: публикация в канал — только по этой кнопке
+    (решение владельца 15.11: бот не постит в канал без апрува)."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Опубликовать в канал", callback_data=f"dgr:ok:{day}"),
+        InlineKeyboardButton(text="❌ Не надо", callback_data=f"dgr:no:{day}"),
+    ]])
+
+
+def _close_digest_window(db) -> None:
+    """Решение по дайджесту принято: окно закрываем «сейчас» (посты,
+    вошедшие в решённую сводку, завтра не повторятся), проект из БД убираем."""
+    db.set_setting("chandigest_since", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    db.set_setting("chandigest_draft", "")
+    db.set_setting("chandigest_draft_date", "")
+
+
+async def resolve_digest(action: str, day: str, services) -> str:
+    """Кнопки проекта дайджеста («Опубликовать» / «Не надо») — ядро без aiogram.
+
+    Исходы:
+    'ok'       — пост в канале вышел (окно закрыто, проект снят);
+    'rejected' — отклонено: в канал не уходит, окно закрыто (завтра эти
+                 посты в сводку не вернутся);
+    'nodraft'  — проекта нет (уже решён/утрачен) — панель ни к чему;
+    'stale'    — панель от другой даты: уже предложена более свежая сводка;
+    'nochan'   — канал не задан (/setchannel);
+    'fail'     — Telegram не принял пост (бот не админ? сеть?) — панель
+                 остаётся, можно нажать снова.
+    """
+    db, cfg = services.db, services.cfg
+    draft = db.get_setting("chandigest_draft", "")
+    draft_day = db.get_setting("chandigest_draft_date", "")
+    if not draft or not draft_day:
+        return "nodraft"
+    if day != draft_day:
+        return "stale"
+    if action == "no":
+        _close_digest_window(db)
+        return "rejected"
+    target = moderation_target(cfg, db)
+    if not target:
+        return "nochan"
+    try:
+        await services.sender.send_text(target, draft)
+    except Exception as e:  # noqa: BLE001 — пост не ушёл: панель остаётся для повтора
+        log.warning("Публикация дайджеста в канал %s не прошла: %s", target, e)
+        return "fail"
+    _close_digest_window(db)
+    return "ok"
+
+
 async def maybe_scheduled(cfg, db, sender) -> None:
     """Точка входа из цикла монитора: дайджест дня + недельный отчёт.
 
@@ -122,7 +181,7 @@ async def maybe_scheduled(cfg, db, sender) -> None:
     msk = _msk_now()
     target = moderation_target(cfg, db)
 
-    # --- вечерний дайджест канала
+    # --- вечерний дайджест: ПРОЕКТ владельцу, в канал — только по кнопке
     if target and cfg.chan_digest_hour > 0 and msk.hour >= cfg.chan_digest_hour:
         today = msk.date().isoformat()
         if db.get_setting("chandigest_date", "") != today:
@@ -132,15 +191,33 @@ async def maybe_scheduled(cfg, db, sender) -> None:
             rows = db.posted_since(since, DIGEST_ITEMS_MAX)
             # полный счётчик — «Всего за день: N» даже когда показываем 10
             total = db.posted_count_since(since)
-            try:
-                html = render_channel_digest(
-                    rows, await _link_base(sender.bot, target), msk, total=total)
-                await sender.send_text(target, html)
-                db.set_setting("chandigest_since", datetime.now(timezone.utc).isoformat(timespec="seconds"))
-                db.set_setting("chandigest_date", today)
-                log.info("Вечерний дайджест канала ушёл: %d позиций", len(rows))
-            except Exception as e:  # noqa: BLE001 — маркер не двигаем: попробуем в следующий проход
-                log.warning("Вечерний дайджест не ушёл: %s", e)
+            if not rows and not total:
+                # постить нечего: пустой «сводки дня» в канал не будет вовсе.
+                # Маркер дня НЕ ставим — появится пост, предложим тем же вечером
+                log.debug("Дайджест: постов с %s нет — проект не формирую", since)
+            elif not cfg.admin_chat_id:
+                # некому апрувить: в канал молча не постим (правило владельца)
+                log.debug("Дайджест: ADMIN_CHAT_ID не задан — без проекта")
+            else:
+                try:
+                    html = render_channel_digest(
+                        rows, await _link_base(sender.bot, target), msk, total=total)
+                    # проект в БД переживает рестарты ранов: кнопка достанет
+                    # его и после замещения, ровно как отправлено в превью
+                    db.set_setting("chandigest_draft", html)
+                    db.set_setting("chandigest_draft_date", today)
+                    proposal = (
+                        "🎛 <b>Проект вечернего дайджеста</b> — таким его увидит канал.\n"
+                        "Публикация — только по вашей кнопке.\n\n" + html
+                    )
+                    await sender.send_text(
+                        cfg.admin_chat_id, proposal, markup=digest_keyboard(today),
+                    )
+                    db.set_setting("chandigest_date", today)
+                    log.info("Проект вечернего дайджеста ушёл владельцу: %d позиций "
+                             "(публикация — по кнопке)", len(rows))
+                except Exception as e:  # noqa: BLE001 — маркер не двигаем: попробуем в следующий проход
+                    log.warning("Проект дайджеста не ушёл: %s", e)
 
     # --- недельная аналитика владельцу (воскресенье)
     if (cfg.week_report_hour > 0 and cfg.admin_chat_id
