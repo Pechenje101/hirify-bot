@@ -23,7 +23,8 @@ from .digest import (
 from .hirify import HirifyAutomationError, HirifyRestrictedError
 from .moderation import (
     auto_bind_channel, close_job, delete_post, manage_keyboard,
-    moderation_target, panel_keyboard, panel_text, publish_job,
+    moderation_target, offer_manual_moderation, panel_keyboard,
+    panel_text, publish_job,
 )
 from .monitor import POLL_JITTER
 from .parsing import _api_contacts
@@ -215,6 +216,24 @@ async def _send_all_formats(chat_id: int, v, services: Services) -> None:
                 chat_id, texts.AUTOCARD_FELLBACK.format(asked=label, got=got))
 
 
+async def _offer_manual_publish(message: Message, v, services: Services) -> None:
+    """Панель «✅ Опубликовать / ❌ Отклонить» под ручной карточкой владельца.
+
+    Ядро — offer_manual_moderation: очередь и решение живут в БД, кнопка
+    «Опубликовать» постит карточку в канал тем же конвейером, что вакансии
+    из фида. Не владелец — тихо без панели; канал не задан — подсказка
+    как включить (тоже только владельцу).
+    """
+    uid = message.from_user.id if message.from_user else 0
+    outcome = await offer_manual_moderation(uid, v, services)
+    if (outcome == "off" and services.cfg.admin_chat_id
+            and uid == services.cfg.admin_chat_id):
+        await message.answer(
+            texts.MODERATION_OFF_HINT, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
 @router.message(Command("card"))
 async def cmd_card(message: Message, command: CommandObject, services: Services):
     """Карточка из СВОЕГО текста вакансии: /card <текст> — во всех наших видах.
@@ -222,9 +241,11 @@ async def cmd_card(message: Message, command: CommandObject, services: Services)
     Парсер распознаёт заголовок/компанию/зарплату/формат/грейд/скиллы/контакты
     (app/textparse.py), дальше карточка идёт тремя видами подряд (Пузырь,
     Rich, классика) — удобно выбрать, какой нравится (в /settings — для
-    рассылки). В БД мониторинга ничего не пишется: это разовый рендер.
-    То же самое бот делает сам, если просто прислать текст вакансии
-    сообщением или файлом .txt/.md (см. fallback/on_document ниже).
+    рассылки). Владельцу с заданным каналом карточка ещё и встаёт в очередь
+    модерации — панель «Опубликовать/Отклонить» под ней (см.
+    _offer_manual_publish). То же самое бот делает сам, если просто
+    прислать текст вакансии сообщением или файлом .txt/.md (см.
+    fallback/on_document ниже).
     """
     if not await _ensure_private(message):
         return
@@ -239,6 +260,7 @@ async def cmd_card(message: Message, command: CommandObject, services: Services)
     v = parse_vacancy_text(raw)
     await _card_summary(message, v)
     await _send_all_formats(message.chat.id, v, services)
+    await _offer_manual_publish(message, v, services)
 
 
 @router.message(Command("fresh"))
@@ -1035,6 +1057,7 @@ async def on_document(message: Message, services: Services):
     v = parse_vacancy_text(raw)
     await _card_summary(message, v)
     await _send_all_formats(message.chat.id, v, services)
+    await _offer_manual_publish(message, v, services)
 
 
 @router.message()
@@ -1049,6 +1072,7 @@ async def fallback(message: Message, services: Services):
         v = parse_vacancy_text(message.text[:4000])
         await _card_summary(message, v)
         await _send_all_formats(message.chat.id, v, services)
+        await _offer_manual_publish(message, v, services)
         return
     await message.answer(texts.FALLBACK_HINT, parse_mode="HTML")
 

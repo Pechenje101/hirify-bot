@@ -16,7 +16,11 @@
    «🔒 Закрыть» (правит пост: замочек, кнопки сняты) и
    «🗑 Удалить пост»;
 4) очередь и решения живут в БД (jobs.mod_status): /pending показывает
-   нерешённые панели заново после любого рестарта.
+   нерешённые панели заново после любого рестарта;
+5) РУЧНЫЕ вакансии (владелец прислал описание сам — текстом, /card или
+   файлом .txt/.md) с 15.11 идут тем же конвейером: offer_manual_
+   moderation ставит карточку в очередь — «✅ Опубликовать» постит её
+   в канал, как вакансии из фида.
 
 Канал публикации задаётся /setchannel <@имя | -100…> (админ; хранится в БД)
 или POST_CHANNEL_ID в окружении. Если бот уже добавлен в канал админом,
@@ -139,6 +143,52 @@ async def queue_for_moderation(
         )
     except Exception as e:  # noqa: BLE001 — панель не критична: /pending достанет
         log.warning("Панель модерации job %s не ушла: %s", job_id, e)
+
+
+async def offer_manual_moderation(user_id: int, v, services) -> str:
+    """Ручная вакансия (текст/файл от владельца) → очередь модерации.
+
+    Вызывается из авто-карточек после рендера: владелец прислал описание
+    вакансии сам — бот собрал карточку, и под ней появляется та же панель
+    «✅ Опубликовать / ❌ Отклонить», что у вакансий из фида. job_id
+    текстовых вакансий детерминированный (crc32 текста, 700M+): тот же
+    текст снова → та же вакансия, панель не дублируется.
+
+    Исходы:
+    'off'     — канал публикаций не задан (модерация выключена);
+    'foreign' — приславший не владелец (канал владельца — его решения);
+    'pending' — уже в очереди (панель не дублируем, /pending покажет);
+    'posted'  — уже опубликована/закрыта/удалена;
+    'queued'  — панель поставлена (в т.ч. повторно после «Отклонить»).
+    """
+    cfg, db = services.cfg, services.db
+    if not moderation_active(cfg, db):
+        return "off"
+    if cfg.admin_chat_id and user_id != cfg.admin_chat_id:
+        return "foreign"
+    job = db.get_job(v.job_id)
+    status = (job.get("mod_status") or "") if job else ""
+    if status == "queue":
+        return "pending"
+    if status in ("posted", "closed", "deleted"):
+        return "posted"
+    if job is None:
+        # карточка уже доставлена рендером авто-карточки — это 'sent',
+        # а не 'new': конвейер доставки её не ждёт
+        db.add_job(
+            v.job_id, v.slug, v.url or "",
+            title=v.title or "", company=v.company or "", salary=v.salary or "",
+            tg_contacts=[
+                {"kind": c.kind, "value": c.value, "display": c.display}
+                for c in v.contacts
+            ],
+        )
+        db.mark_job(v.job_id, "sent")
+    if status == "no":
+        # «Отклонить» не навсегда: тот же текст снова предложит панель
+        db.set_mod(v.job_id, "")
+    await queue_for_moderation(v.job_id, v, cfg, db, services.sender, True)
+    return "queued"
 
 
 async def publish_job(job_id: int, services) -> str:

@@ -15,8 +15,8 @@ from app.db import Database  # noqa: E402
 from app.monitor import Monitor  # noqa: E402
 from app.moderation import (  # noqa: E402
     auto_bind_channel, close_job, delete_post, manage_keyboard,
-    moderation_active, moderation_target, panel_keyboard, panel_text,
-    publish_job, queue_for_moderation,
+    moderation_active, moderation_target, offer_manual_moderation,
+    panel_keyboard, panel_text, publish_job, queue_for_moderation,
 )
 from app.parsing import vacancy_from_payload, vacancy_to_payload  # noqa: E402
 from app.services import Services  # noqa: E402
@@ -479,3 +479,62 @@ def test_channel_post_handler_ignores_own_posts():
     assert db2.get_setting("post_channel_id") == "-100777"
     assert len(sender2.texts) == 1
     db2.close()
+
+
+# ------------------------------------------------- ручные вакансии (15.11)
+
+def test_manual_offer_queues_panel():
+    """Владелец прислал текст → карточка в очереди, панель с кнопками ушла ему."""
+    sv = make_services()
+    v = sample_vacancy()
+    assert asyncio.run(offer_manual_moderation(ADMIN, v, sv)) == "queued"
+    job = sv.db.get_job(v.job_id)
+    assert job["status"] == "sent"          # карточка уже доставлена рендером
+    assert job["mod_status"] == "queue"
+    assert job["payload"]                     # карточка восстановима после рестарата
+    assert sv.sender.texts and sv.sender.texts[-1][0] == ADMIN
+    kb = sv.sender.texts[-1][2]
+    labels = {b.text for row in kb.inline_keyboard for b in row}
+    assert labels == {"✅ Опубликовать", "❌ Отклонить"}
+    sv.db.close()
+
+
+def test_manual_offer_foreign_and_off():
+    """Чужой пользователь очередь не получает; без канала — 'off'."""
+    sv = make_services()
+    v = sample_vacancy()
+    assert asyncio.run(offer_manual_moderation(999, v, sv)) == "foreign"
+    assert sv.db.get_job(v.job_id) is None    # ничего не писали
+    assert not sv.sender.texts
+    sv.db.close()
+
+    sv_off = make_services(post_channel_id=0)
+    assert asyncio.run(offer_manual_moderation(ADMIN, sample_vacancy(), sv_off)) == "off"
+    sv_off.db.close()
+
+
+def test_manual_offer_no_duplicate_and_requeue_after_reject():
+    """Тот же текст дважды — панель не дублируется; после «Отклонить» вернётся."""
+    sv = make_services()
+    v = sample_vacancy()                      # job_id детерминирован текстом
+    assert asyncio.run(offer_manual_moderation(ADMIN, v, sv)) == "queued"
+    assert asyncio.run(offer_manual_moderation(ADMIN, v, sv)) == "pending"
+    assert len(sv.sender.texts) == 1
+    sv.db.set_mod(v.job_id, "no")             # владелец отклонил…
+    assert asyncio.run(offer_manual_moderation(ADMIN, v, sv)) == "queued"
+    assert sv.db.get_job(v.job_id)["mod_status"] == "queue"   # …передумал
+    assert len(sv.sender.texts) == 2           # панель предложена снова
+    sv.db.close()
+
+
+def test_manual_publish_end_to_end():
+    """Текст от владельца → очередь → «Опубликовать» → пост в канале."""
+    sv = make_services()
+    v = sample_vacancy()
+    asyncio.run(offer_manual_moderation(ADMIN, v, sv))
+    assert asyncio.run(publish_job(v.job_id, sv)) == "ok"
+    assert sv.sender.sent[0][0] == CHANNEL    # карточка ушла в канал
+    assert sv.sender.displays[0] == "classic"  # пост в канал — всегда классика
+    job = sv.db.get_job(v.job_id)
+    assert job["mod_status"] == "posted" and job["chan_msg_id"] == 4242
+    sv.db.close()
