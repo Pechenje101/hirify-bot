@@ -59,6 +59,7 @@ async def main() -> int:
 
     # анонимный путь: клиент без cookie — аккаунт в тесте не участвует
     client = HirifyClient(cfg)
+    await client.open()
     landing = await client.fetch_job(row["url"])
     await client.close()
     v = parse_job_page(landing, row["url"])
