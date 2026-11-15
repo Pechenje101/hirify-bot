@@ -1,0 +1,34 @@
+name: Тест-карточка
+
+# Разовая (по кнопке) доставка вакансии с сайта владельцу — proof-of-life
+# конвейера «анонимный лендинг -> карточка -> кнопка контактов». Живой ран
+# бота НЕ трогаем: своего concurrency-группы нет, getUpdates не зовём,
+# только sendMessage. Токен живёт в секретах, в репо не попадает.
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'Слаг вакансии с hirify.me (пусто — свежая крипто-вакансия из БД)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+      - name: Отправить карточку владельцу
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: python tools/send_test_card.py ${{ github.event.inputs.slug }}
