@@ -342,7 +342,7 @@ HIRIFY_FEEDS=remote,global,crypto        # по умолчанию: все тр�
 Настройка — в `.env` / окружении воркфлоу:
 
 ```
-TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs
+TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs,iGamingoffice
 ```
 
 Подключённые каналы (все проверены анонимным чтением `t.me/s`, живые в 2026):
@@ -359,9 +359,12 @@ TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwor
 | `fintech_vacancy` | финтех / платежи |
 | `HRCPAgram` | CPA / арбитраж трафика |
 | `holder_job_devs` | web3-разработка (EN, HIRING NOW с @контактом) |
+| `iGamingoffice` | iGaming: полный спектр (SEO/2D/QA/HR/Sales; контакт в href якоря) |
 
 Проверено 13.11: у 5 новых из 6 — 60–94% постов-вакансий с прямым
-@контактом (производственный фильтр `has_direct_contact`). Отклонены:
+@контактом (производственный фильтр `has_direct_contact`). `iGamingoffice`
+(17.11): 19/20 постов с контактом — ссылка рекрутера прячется в href
+якоря «✅ Контакт для связи», экстрактор её достаёт (см. channels.py). Отклонены:
 `r2bwork` (посты — заглушки-указатели, текстов вакансий нет), `viva_aff`
 (не канал), `blockchain_job` / `job_crypto_ru` / `GamblingServices` (мертвы
 с 2023), англоязычные борды `cryptojobslist` / `web3hiring` (ведения на

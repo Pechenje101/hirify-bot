@@ -133,6 +133,83 @@ VACANCY_POST = (
 )
 
 
+# --- контакт в href якоря «Контакт для связи» (стиль iGamingoffice) ---
+# реальная разметка t.me/s: ссылка рекрутера спрятана в href якоря, видимый
+# текст — только маркер «✅ Контакт для связи» (эмодзи — <img alt>), рядом —
+# промо-подписка на сторонний канал инвайтом t.me/+…
+PAGE_HREF_CONTACT = """
+<html><body><div class="tgme_container">
+ <div class="tgme_widget_message_wrap">
+  <div class="tgme_widget_message" data-post="iGamingoffice/452">
+   <div class="tgme_widget_message_bubble">
+    <div class="tgme_widget_message_text js-message_text" dir="auto">
+      📃SEO Specialist<br/>Компания: NDA<br/>Режим работы: удаленный<br/>
+      <a href="http://t.me/ignis_mou"><b><i class="emoji"><b>✅</b></i> Контакт для связи</b></a><br/>
+      Подпишитесь на наш основной канал —
+      <a href="https://t.me/+R42lpqUkGxhhYzhh">Data Office</a>
+    </div>
+    <time datetime="2026-11-16T09:00:00+00:00">09:00</time>
+   </div>
+  </div>
+ </div>
+ <div class="tgme_widget_message_wrap">
+  <div class="tgme_widget_message" data-post="iGamingoffice/453">
+   <div class="tgme_widget_message_text js-message_text" dir="auto">
+      Аналитика рынка в цифрах, апдейты<br/>
+      Резюме: <a href="https://t.me/hr_igaming">@hr_igaming</a>
+   </div>
+   <time datetime="2026-11-16T10:00:00+00:00">10:00</time>
+  </div>
+ </div>
+ <div class="tgme_widget_message_wrap">
+  <div class="tgme_widget_message" data-post="iGamingoffice/454">
+   <div class="tgme_widget_message_text js-message_text" dir="auto">
+      Sales Manager, NDA, удалёнка, зарплата от 2000$<br/>
+      Написать: <a href="https://t.me/Dmitryy_HR">Dmitryy_HR</a>
+   </div>
+   <time datetime="2026-11-16T11:00:00+00:00">11:00</time>
+  </div>
+ </div>
+</div></body></html>
+"""
+
+
+def test_contact_in_href_of_anchor():
+    """Контакт, спрятанный в href, дописывается в текст поста.
+
+    452 — «✅ Контакт для связи» → href t.me/ignis_mou: username дописан
+          строкой «Контакт: @ignis_mou», промо-инвайты и чужие ссылки — нет;
+    453 — старый стиль (@упоминание в тексте): дубликата не появляется;
+    454 — голый username текстом якоря: тоже поднят в «Контакт: @…».
+    """
+    posts = parse_channel_html(PAGE_HREF_CONTACT)
+    assert [p["id"] for p in posts] == [452, 453, 454]
+    p452, p453, p454 = posts
+
+    # контакт из href дописан, инвайт промо-подписки — нет
+    assert "Контакт: @ignis_mou" in p452["text"]
+    assert "R42lpqUkGxhhYzhh" not in p452["text"]
+    assert "Data Office" in p452["text"]          # видимый текст якоря — как был
+    assert "Контакт для связи" in p452["text"]   # маркер остался в тексте
+
+    # конвейер: детектор пропускает, контакт материализован
+    from app.textparse import looks_like_vacancy, parse_vacancy_text
+    assert looks_like_vacancy(p452["text"])
+    v = parse_vacancy_text(p452["text"], feed_key="tg_igamingoffice")
+    assert v.has_direct_contact
+    assert any(c.value.lower() == "ignis_mou" for c in v.contacts)
+
+    # старый стиль: @упоминание уже в тексте — дубль не дописывается
+    assert p453["text"].count("@hr_igaming") == 1
+    assert "Контакт:" not in p453["text"]
+
+    # голый username текстом якоря (без @): поднят в «Контакт: @…»
+    assert "Контакт: @Dmitryy_HR" in p454["text"]
+    v454 = parse_vacancy_text(p454["text"], feed_key="tg_igamingoffice")
+    assert v454.has_direct_contact
+    assert any(c.value.lower() == "dmitryy_hr" for c in v454.contacts)
+
+
 def test_pipeline_from_channel_post_text():
     """Текст поста канала → детектор пропускает → Vacancy с контактом."""
     from app.textparse import looks_like_vacancy, parse_vacancy_text

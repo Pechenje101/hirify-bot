@@ -21,6 +21,7 @@ CPA/маркетинг, пейменты) плотнее живут в тема�
 from __future__ import annotations
 
 import logging
+import re
 import zlib
 from html.parser import HTMLParser
 
@@ -55,6 +56,23 @@ def channel_job_id(channel: str, message_id: int) -> int:
     return -((h << 28) | (message_id & 0xFFFFFFF))
 
 
+# Контакт в href, а не в тексте: каналы вакансий (напр. iGamingoffice) дают
+# ссылку рекрутера якорем «✅ Контакт для связи» — видимый текст лишь маркер,
+# username спрятан в href (t.me/<username>). Без вытаскивания href пост
+# отбраковывается фильтром «нет контакта» целиком. Слова-признаки якоря
+# (RU/EN), по которым href считаем контактом вакансии: мимо — промо-подписки
+# («Подпишитесь на канал»), инвайты t.me/+…, ссылки на другие посты.
+_CONTACT_ANCHOR_RE = re.compile(
+    r"(контакт|связ|отклик|резюме|написать|писать|в\s*лс|личк|hr\b"
+    r"|contact|apply|dm\b|cv\b|resume|message)",
+    re.IGNORECASE,
+)
+# Ссылка на юзера (рекрутера): t.me/<username> БЕЗ хвоста пути. Инвайты
+# (t.me/+…), посты каналов (t.me/<name>/<id>) и сервисные пути не подходят.
+_TG_USER_LINK_RE = re.compile(
+    r"^(?:https?://)?t\.me/([A-Za-z][A-Za-z0-9_]{3,31})/?$", re.IGNORECASE)
+
+
 class _PostExtractor(HTMLParser):
     """Вытаскивает из t.me/s посты: id (data-post="канал/123"), текст
     (div.tgme_widget_message_text) и дату (<time datetime=…>).
@@ -69,6 +87,12 @@ class _PostExtractor(HTMLParser):
     Особенности разметки, которые учитываем: <br/> → \\n, <img alt="🔥"> →
     эмодзи из alt, <a>текст</a> → текст (юserнеймы Telegram сам оборачивает
     ссылкой — текст и есть @упоминание), сущности (&amp;…) — convert_charrefs.
+
+    Контакт в href: у каналов-вакансий (напр. iGamingoffice) ссылка
+    рекрутера живёт в href якоря «✅ Контакт для связи», видимый текст —
+    лишь маркер. Такой username собираем отдельно и дописываем в текст
+    поста строкой «✉️ Контакт: @…» (если его нет в @упоминаниях/ссылках
+    текста) — иначе конвейер отбракует пост «нет контакта».
     """
 
     def __init__(self) -> None:
@@ -80,6 +104,10 @@ class _PostExtractor(HTMLParser):
         self._capture = False
         self._in_anchor = False
         self._post_open = False
+        self._channel = ""           # имя канала (ссылки на себя — не контакт)
+        self._anchor_href = ""       # href открытого внутри-текстового якоря
+        self._anchor_parts: list[str] = []  # видимый текст открытого якоря
+        self._contact_candidates: list[str] = []  # username'ы из contact-якорей
 
     def handle_starttag(self, tag: str, attrs) -> None:
         a = {k: (v or "") for k, v in attrs}
@@ -89,6 +117,7 @@ class _PostExtractor(HTMLParser):
             self._id = None
             self._dt = ""
             self._parts = []
+            self._contact_candidates = []
             self._post_open = True
             # старая структура держала data-post прямо на wrap — берём и его
             dp = a.get("data-post") or ""
@@ -102,6 +131,8 @@ class _PostExtractor(HTMLParser):
         if tag == "div" and data_post and self._id is None:
             mid = data_post.partition("/")[2]
             self._id = int(mid) if mid.isdigit() else None
+            if not self._channel:
+                self._channel = data_post.partition("/")[0]
         elif tag == "time" and not self._dt:
             self._dt = a.get("datetime") or ""
         elif tag == "div" and "tgme_widget_message_text" in cls:
@@ -113,27 +144,68 @@ class _PostExtractor(HTMLParser):
                 alt = a.get("alt") or ""
                 if alt:
                     self._parts.append(alt)  # эмодзи-картинки: текст = alt
+                    if self._in_anchor:
+                        self._anchor_parts.append(alt)
             elif tag == "a":
                 self._in_anchor = True
+                if not self._anchor_href:
+                    self._anchor_href = a.get("href") or ""
+                    self._anchor_parts = []
 
     def handle_endtag(self, tag: str) -> None:
         if self._capture and tag == "div":
             self._capture = False
         if tag == "a":
             self._in_anchor = False
+            if self._anchor_href and self._capture:
+                self._register_contact(
+                    self._anchor_href, "".join(self._anchor_parts))
+            self._anchor_href = ""
+            self._anchor_parts = []
 
     def handle_data(self, data: str) -> None:
         if self._capture and data:
             self._parts.append(data)
+            if self._in_anchor:
+                self._anchor_parts.append(data)
+
+    def _register_contact(self, href: str, anchor_text: str) -> None:
+        """Якорь с href t.me/<username>: контакт вакансии, если текст якоря —
+        маркер («Контакт для связи»/«Откликнуться»/…) либо сам username.
+        Инвайты t.me/+…, посты t.me/<канал>/<id> и промо-подписки (имя
+        стороннего канала без слов-маркеров) мимо — не контакт."""
+        m = _TG_USER_LINK_RE.match((href or "").strip())
+        if not m:
+            return
+        username = m.group(1)
+        low = (anchor_text or "").strip().lower()
+        if username.lower() == self._channel.lower():
+            return  # канал ссылается на себя — не контакт
+        if not (_CONTACT_ANCHOR_RE.search(low)
+                or username.lower() in low
+                or f"@{username}".lower() in low):
+            return
+        if username not in self._contact_candidates:
+            self._contact_candidates.append(username)
 
     def _flush(self) -> None:
         if self._id is None:
             return
         text = "".join(self._parts).strip()
+        if text and self._contact_candidates:
+            # контакт из href, не попавший в текст — дописываем строкой;
+            # username уже есть в тексте (@упоминание/ссылка) — не дублируем
+            low = text.lower()
+            for u in self._contact_candidates:
+                if (f"@{u}".lower() not in low
+                        and f"t.me/{u}".lower() not in low):
+                    text += f"\n✉️ Контакт: @{u}"
+                    low = text.lower()
         if text:
             self.posts.append({"id": self._id, "created_at": self._dt, "text": text})
         self._id = None
         self._post_open = False
+        self._contact_candidates = []
 
     def close(self) -> None:  # последний пост не имеет «следующего»
         self._flush()
