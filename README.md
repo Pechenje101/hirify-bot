@@ -342,7 +342,7 @@ HIRIFY_FEEDS=remote,global,crypto        # по умолчанию: все тр�
 Настройка — в `.env` / окружении воркфлоу:
 
 ```
-TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs,iGamingoffice
+TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs,iGamingoffice,gambling_vacancy,roi_hunters,fintech_work,workingincrypto
 ```
 
 Подключённые каналы (все проверены анонимным чтением `t.me/s`, живые в 2026):
@@ -360,6 +360,22 @@ TG_CHANNELS=cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwor
 | `HRCPAgram` | CPA / арбитраж трафика |
 | `holder_job_devs` | web3-разработка (EN, HIRING NOW с @контактом) |
 | `iGamingoffice` | iGaming: полный спектр (SEO/2D/QA/HR/Sales; контакт в href якоря) |
+| `gambling_vacancy` | гемблинг / iGaming: математики, маркетинг, CRM |
+| `roi_hunters` | афф / трафик: медиабаеры, баеры, админы (LENKEP-стиль хэштегов) |
+| `fintech_work` | финтех / пейменты (сеть betting_job; микс общих вакансий — режет модерация) |
+| `workingincrypto` | крипто / web3 / финтех (EN+RU, лучший из сетки cryptoheadhunter) |
+
+Проверено 25.11 (+4 канала): `gambling_vacancy` 19/20 постов-вакансий с
+контактом (посты день в день), `roi_hunters` 14/20, `workingincrypto`
+15/20, `fintech_work` 9/20. Отклонены: `igaming_offer` (канал РЕЗЮМЕ,
+не вакансий — «Опыт 8+ лет…»), `lenkep_global` (0/20 без прямых
+TG-контактов), `igamingjobs` (тихий с сентября), `CryptoWeb3Work`
+(тихий, слабее сетки), `careers_crypto`/`opento_crypto`/`web30job`/
+`cryptovakansii` (кросс-посты одной сетки — 15–16 общих заголовков
+из 20, рабочий кандидат из неё один: workingincrypto), `casino_jobs`/
+`igaming_jobs`/`cryptojobs`/`gambling_jobs`/`igaming_vacancy` (мертвы/
+пусты), `igaming_cv` (резюме), `fintech_jobs` (узбекский hh.uz-агрегатор,
+тихий с мая).
 
 Проверено 13.11: у 5 новых из 6 — 60–94% постов-вакансий с прямым
 @контактом (производственный фильтр `has_direct_contact`). `iGamingoffice`

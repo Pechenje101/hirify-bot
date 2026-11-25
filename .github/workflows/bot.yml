@@ -95,7 +95,12 @@ jobs:
           # у 5 из 6 — 60-94% вакансий с прямым @контактом (r2bwork
           # отклонён: посты-заглушки; viva_aff не канал; blockchain_job/
           # job_crypto_ru/GamblingServices мертвы с 2023).
-          TG_CHANNELS: 'cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs,iGamingoffice'
+          # +4 добавлены 25.11 живой пробой (см. README «Проверено 25.11»):
+          # gambling_vacancy (19/20 с контактом), roi_hunters (14/20),
+          # fintech_work (9/20, сеть betting_job), workingincrypto (15/20 —
+          # единственный из крипто-сетки: 4 остальных канала сетки
+          # кросс-постят друг друга, 15-16 общих заголовков из 20).
+          TG_CHANNELS: 'cpa_people,opento_igaming,IT_iGaming,betting_job,igaming_work,igcwork,cryptoheadhunter,fintech_vacancy,HRCPAgram,holder_job_devs,iGamingoffice,gambling_vacancy,roi_hunters,fintech_work,workingincrypto'
           # САЙТ ВОЗВРАЩЁН (решение владельца 15.11): фид читается анонимно
           # (аккаунт не светится), карточки идут из анонимных данных, контакты
           # — только по кнопке живого интереса. Диагноз прошлого флага — не
